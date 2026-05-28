@@ -1,7 +1,7 @@
 "use client"
 
 import * as React from "react"
-import { Frame, Maximize, Minus, Plus } from "lucide-react"
+import { Frame, Maximize, Minus, Plus, Sparkles } from "lucide-react"
 
 import {
   PhotoDock,
@@ -9,6 +9,12 @@ import {
   makePhotoFromFile,
   type Photo,
 } from "@/components/photo-dock"
+import {
+  ReferenceCard,
+  ReferenceEmptyCard,
+  makeReferenceFromFile,
+  type ReferenceImage,
+} from "@/components/reference-image"
 import { Button } from "@/components/ui/button"
 import { Separator } from "@/components/ui/separator"
 import { cn } from "@/lib/utils"
@@ -785,6 +791,7 @@ export function CanvasHero() {
     null
   )
   const [isDockExpanded, setIsDockExpanded] = React.useState(false)
+  const [reference, setReference] = React.useState<ReferenceImage | null>(null)
 
   // Blob URLs are session-scoped — revoke them when the component unmounts so
   // we don't leak memory or hold onto detached files.
@@ -795,6 +802,18 @@ export function CanvasHero() {
     // We intentionally only run this on unmount; per-photo revocation happens
     // in handleRemove.
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Keep a ref in sync so the unmount cleanup can revoke the *current* reference
+  // URL (replace/remove already revoke eagerly).
+  const referenceRef = React.useRef<ReferenceImage | null>(null)
+  React.useEffect(() => {
+    referenceRef.current = reference
+  }, [reference])
+  React.useEffect(() => {
+    return () => {
+      if (referenceRef.current) URL.revokeObjectURL(referenceRef.current.url)
+    }
   }, [])
 
   const handleAddPhotos = React.useCallback(
@@ -834,6 +853,51 @@ export function CanvasHero() {
     })
     setSelectedPhotoId((curr) => (curr === id ? null : curr))
   }, [])
+
+  const handleSetReference = React.useCallback(async (file: File) => {
+    try {
+      const next = await makeReferenceFromFile(file)
+      setReference((prev) => {
+        if (prev) URL.revokeObjectURL(prev.url)
+        return next
+      })
+    } catch {
+      // Unreadable image — keep current state so the user can retry.
+    }
+  }, [])
+
+  const handleRemoveReference = React.useCallback(() => {
+    setReference((prev) => {
+      if (prev) URL.revokeObjectURL(prev.url)
+      return null
+    })
+  }, [])
+
+  const handleGenerate = React.useCallback(() => {
+    // TODO: mosaic generation (future phase) — assemble `photos` into a mosaic
+    // that matches `reference`, then swap it in for the placeholder artwork.
+  }, [])
+
+  // Paste an image from the clipboard to set or replace the reference.
+  React.useEffect(() => {
+    const onPaste = (e: ClipboardEvent) => {
+      if (isTypingTarget(e.target)) return
+      const items = e.clipboardData?.items
+      if (!items) return
+      for (const item of Array.from(items)) {
+        if (item.type.startsWith("image/")) {
+          const file = item.getAsFile()
+          if (file) {
+            e.preventDefault()
+            void handleSetReference(file)
+            break
+          }
+        }
+      }
+    }
+    window.addEventListener("paste", onPaste)
+    return () => window.removeEventListener("paste", onPaste)
+  }, [handleSetReference])
 
   return (
     <section className="relative h-svh w-full overflow-hidden bg-muted/60 select-none">
@@ -881,16 +945,31 @@ export function CanvasHero() {
             "transition-opacity duration-300"
           )}
         >
-          <CanvasArtwork />
+          {reference ? (
+            <div className="size-full bg-white" />
+          ) : (
+            <CanvasArtwork />
+          )}
         </div>
       </div>
 
-      {/* Top-left wordmark */}
-      <div
-        data-no-pan
-        className="absolute top-6 left-6 z-20 rounded-2xl border border-border/60 bg-popover/85 px-3 py-1.5 font-mono text-xs backdrop-blur-md"
-      >
-        Tapestry
+      {/* Top-left: wordmark + reference card */}
+      <div className="absolute top-6 left-6 z-20 flex flex-col gap-2">
+        <div
+          data-no-pan
+          className="w-fit rounded-2xl border border-border/60 bg-popover/85 px-3 py-1.5 font-mono text-xs backdrop-blur-md"
+        >
+          Tapestry
+        </div>
+        {reference ? (
+          <ReferenceCard
+            reference={reference}
+            onReplace={handleSetReference}
+            onRemove={handleRemoveReference}
+          />
+        ) : (
+          <ReferenceEmptyCard onSelect={handleSetReference} />
+        )}
       </div>
 
       {/* Zoom toolbar */}
@@ -901,6 +980,22 @@ export function CanvasHero() {
         onFit={fitToView}
         on100={reset100}
       />
+
+      {/* Generate the mosaic from the tiles (enabled once tiles exist) */}
+      {reference && (
+        <div data-no-pan className="absolute right-6 bottom-14 z-20">
+          <Button
+            size="lg"
+            onClick={handleGenerate}
+            disabled={photos.length === 0}
+            data-icon="inline-start"
+            className="shadow-xl shadow-black/15"
+          >
+            <Sparkles />
+            Generate mosaic
+          </Button>
+        </div>
+      )}
 
       {/* Bottom dock of polaroid photos */}
       <PhotoDock

@@ -12,6 +12,12 @@ import {
   Sparkles,
 } from "lucide-react"
 
+import {
+  DOCK_PEEK_HEIGHT,
+  PhotoDock,
+  makePhotoFromFile,
+  type Photo,
+} from "@/components/photo-dock"
 import { Button } from "@/components/ui/button"
 import { Separator } from "@/components/ui/separator"
 import { Slider } from "@/components/ui/slider"
@@ -22,6 +28,9 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip"
 import { cn } from "@/lib/utils"
+
+const DOCK_HEIGHT_EXPANDED = 176
+const OVERLAY_GAP = 4
 
 const CANVAS_WIDTH = 1600
 const CANVAS_HEIGHT = 1000
@@ -731,6 +740,7 @@ function CanvasArtwork() {
 
 interface CanvasToolbarProps {
   scale: number
+  bottomOffset: number
   onZoomIn: () => void
   onZoomOut: () => void
   onFit: () => void
@@ -740,6 +750,7 @@ interface CanvasToolbarProps {
 
 function CanvasToolbar({
   scale,
+  bottomOffset,
   onZoomIn,
   onZoomOut,
   onFit,
@@ -750,7 +761,8 @@ function CanvasToolbar({
   return (
     <div
       data-no-pan
-      className="absolute bottom-6 left-1/2 z-20 flex -translate-x-1/2 items-center gap-1 rounded-2xl border border-border/60 bg-popover/85 px-1.5 py-1.5 shadow-xl shadow-black/15 backdrop-blur-md"
+      style={{ bottom: bottomOffset }}
+      className="absolute left-1/2 z-20 flex -translate-x-1/2 items-center gap-1 rounded-2xl border border-border/60 bg-popover/85 px-1.5 py-1.5 shadow-xl shadow-black/15 backdrop-blur-md transition-[bottom] duration-300 ease-out"
     >
       <Tooltip>
         <TooltipTrigger asChild>
@@ -854,6 +866,47 @@ export function CanvasHero() {
     setSliderScale,
     onPointerDown,
   } = useZoomPan()
+
+  const [photos, setPhotos] = React.useState<Photo[]>([])
+  const [selectedPhotoId, setSelectedPhotoId] = React.useState<string | null>(
+    null
+  )
+  const [isDockExpanded, setIsDockExpanded] = React.useState(false)
+  const overlayBottom =
+    (isDockExpanded ? DOCK_HEIGHT_EXPANDED : DOCK_PEEK_HEIGHT) + OVERLAY_GAP
+
+  // Blob URLs are session-scoped — revoke them when the component unmounts so
+  // we don't leak memory or hold onto detached files.
+  React.useEffect(() => {
+    return () => {
+      photos.forEach((p) => URL.revokeObjectURL(p.url))
+    }
+    // We intentionally only run this on unmount; per-photo revocation happens
+    // in handleRemove.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const handleAddPhotos = React.useCallback(
+    (files: File[]) => {
+      setPhotos((prev) => {
+        const next = [
+          ...prev,
+          ...files.map((f, i) => makePhotoFromFile(f, prev.length + i)),
+        ]
+        return next
+      })
+    },
+    []
+  )
+
+  const handleRemovePhoto = React.useCallback((id: string) => {
+    setPhotos((prev) => {
+      const target = prev.find((p) => p.id === id)
+      if (target) URL.revokeObjectURL(target.url)
+      return prev.filter((p) => p.id !== id)
+    })
+    setSelectedPhotoId((curr) => (curr === id ? null : curr))
+  }, [])
 
   return (
     <TooltipProvider delayDuration={250}>
@@ -962,7 +1015,8 @@ export function CanvasHero() {
         {/* Bottom-right keyboard hints */}
         <div
           data-no-pan
-          className="absolute right-6 bottom-6 z-20 hidden items-center gap-1.5 rounded-2xl border border-border/60 bg-popover/70 px-2.5 py-1.5 font-mono text-[10px] tracking-wide text-muted-foreground backdrop-blur-md md:flex"
+          style={{ bottom: overlayBottom }}
+          className="absolute right-6 z-20 hidden items-center gap-1.5 rounded-2xl border border-border/60 bg-popover/70 px-2.5 py-1.5 font-mono text-[10px] tracking-wide text-muted-foreground backdrop-blur-md transition-[bottom] duration-300 ease-out md:flex"
         >
           <Hand className="size-3" />
           drag
@@ -976,11 +1030,23 @@ export function CanvasHero() {
         {/* Bottom-center toolbar */}
         <CanvasToolbar
           scale={transform.scale}
+          bottomOffset={overlayBottom}
           onZoomIn={zoomIn}
           onZoomOut={zoomOut}
           onFit={fitToView}
           on100={reset100}
           onSliderChange={setSliderScale}
+        />
+
+        {/* Bottom dock of polaroid photos */}
+        <PhotoDock
+          photos={photos}
+          selectedId={selectedPhotoId}
+          expanded={isDockExpanded}
+          onExpandedChange={setIsDockExpanded}
+          onAdd={handleAddPhotos}
+          onSelect={setSelectedPhotoId}
+          onRemove={handleRemovePhoto}
         />
       </section>
     </TooltipProvider>

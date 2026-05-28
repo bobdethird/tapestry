@@ -2,13 +2,9 @@
 
 import * as React from "react"
 import { Images, Plus, X } from "lucide-react"
+import exifr from "exifr"
 
 import { Separator } from "@/components/ui/separator"
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from "@/components/ui/tooltip"
 import { cn } from "@/lib/utils"
 
 export type Photo = {
@@ -38,6 +34,39 @@ function captionFromFile(file: File) {
       .slice(0, 24)
       .toLowerCase() || "untitled"
   )
+}
+
+// Format a capture date as a compact MM/DD/YY caption, e.g. "05/28/26".
+function formatDateCaption(date: Date) {
+  return date.toLocaleDateString("en-US", {
+    month: "2-digit",
+    day: "2-digit",
+    year: "2-digit",
+  })
+}
+
+// Read a photo's capture date from EXIF metadata, preferring when the shutter
+// fired (DateTimeOriginal) and falling back through the other date tags.
+// Resolves to a formatted caption, or null when there's no usable date — no
+// EXIF, an unsupported format, or a parse failure — so callers keep using the
+// filename caption. Runs client-side; exifr reads the file bytes directly.
+export async function captionDateFromFile(file: File): Promise<string | null> {
+  try {
+    const exif = await exifr.parse(file, [
+      "DateTimeOriginal",
+      "CreateDate",
+      "ModifyDate",
+    ])
+    const raw = exif?.DateTimeOriginal ?? exif?.CreateDate ?? exif?.ModifyDate
+    if (!raw) return null
+    // exifr revives these tags to Date objects (in local time), but returns the
+    // raw string if it can't parse them — coerce and validate either way.
+    const date = raw instanceof Date ? raw : new Date(raw)
+    if (Number.isNaN(date.getTime())) return null
+    return formatDateCaption(date)
+  } catch {
+    return null
+  }
 }
 
 export function makePhotoFromFile(file: File, index: number): Photo {
@@ -169,7 +198,7 @@ export function PhotoDock({
           <Images className="size-3" />
           photos
           <Separator orientation="vertical" className="h-3" />
-          <span className="tabular-nums text-foreground/80">
+          <span className="text-foreground/80 tabular-nums">
             {photos.length}
           </span>
         </div>
@@ -244,62 +273,57 @@ function PolaroidCard({
   onRemove: () => void
 }) {
   return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <div
-          style={{ rotate: `${photo.rotation}deg` }}
-          className={cn(
-            "group relative shrink-0 snap-center transition-transform duration-200 ease-out",
-            "hover:-translate-y-1.5 hover:[rotate:0deg]",
-            selected && "-translate-y-2 [rotate:0deg]"
-          )}
-        >
-          <button
-            type="button"
-            onClick={onClick}
-            data-selected={selected}
-            className={cn(
-              "block bg-white pt-2.5 pr-2.5 pb-6 pl-2.5",
-              "shadow-[0_10px_24px_-6px_rgba(0,0,0,0.45)] ring-1 ring-black/5",
-              "outline-none transition-shadow",
-              "focus-visible:ring-2 focus-visible:ring-ring",
-              "data-[selected=true]:ring-2 data-[selected=true]:ring-primary"
-            )}
-          >
-            <div className="relative size-20 overflow-hidden bg-stone-100">
-              {/* eslint-disable-next-line @next/next/no-img-element -- user-uploaded blob URLs don't benefit from next/image optimization */}
-              <img
-                src={photo.url}
-                alt={photo.caption}
-                className="size-full object-cover"
-                draggable={false}
-              />
-            </div>
-            <div className="mt-1.5 w-20 truncate text-center font-mono text-[9px] tracking-wide text-stone-600 italic">
-              {photo.caption}
-            </div>
-          </button>
-
-          <button
-            type="button"
-            onClick={(e) => {
-              e.stopPropagation()
-              onRemove()
-            }}
-            aria-label="Remove photo"
-            className={cn(
-              "absolute -top-1.5 -right-1.5 grid size-5 place-items-center rounded-full",
-              "bg-foreground text-background shadow-md",
-              "opacity-0 transition-opacity",
-              "group-hover:opacity-100 focus-visible:opacity-100"
-            )}
-          >
-            <X className="size-3" />
-          </button>
+    <div
+      style={{ rotate: `${photo.rotation}deg` }}
+      className={cn(
+        "group relative shrink-0 snap-center transition-transform duration-200 ease-out",
+        "hover:-translate-y-1.5 hover:[rotate:0deg]",
+        selected && "-translate-y-2 [rotate:0deg]"
+      )}
+    >
+      <button
+        type="button"
+        onClick={onClick}
+        data-selected={selected}
+        className={cn(
+          "block bg-white pt-2.5 pr-2.5 pb-6 pl-2.5",
+          "shadow-[0_10px_24px_-6px_rgba(0,0,0,0.45)] ring-1 ring-black/5",
+          "transition-shadow outline-none",
+          "focus-visible:ring-2 focus-visible:ring-ring",
+          "data-[selected=true]:ring-2 data-[selected=true]:ring-primary"
+        )}
+      >
+        <div className="relative size-20 overflow-hidden bg-stone-100">
+          {/* eslint-disable-next-line @next/next/no-img-element -- user-uploaded blob URLs don't benefit from next/image optimization */}
+          <img
+            src={photo.url}
+            alt={photo.caption}
+            className="size-full object-cover"
+            draggable={false}
+          />
         </div>
-      </TooltipTrigger>
-      <TooltipContent side="top">{photo.caption}</TooltipContent>
-    </Tooltip>
+        <div className="mt-1.5 w-20 truncate text-center font-mono text-[9px] tracking-wide text-stone-600 italic">
+          {photo.caption}
+        </div>
+      </button>
+
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation()
+          onRemove()
+        }}
+        aria-label="Remove photo"
+        className={cn(
+          "absolute -top-1.5 -right-1.5 grid size-5 place-items-center rounded-full",
+          "bg-foreground text-background shadow-md",
+          "opacity-0 transition-opacity",
+          "group-hover:opacity-100 focus-visible:opacity-100"
+        )}
+      >
+        <X className="size-3" />
+      </button>
+    </div>
   )
 }
 

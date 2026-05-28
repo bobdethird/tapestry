@@ -1,59 +1,27 @@
 "use client"
 
 import * as React from "react"
-import {
-  Frame,
-  Hand,
-  Layers,
-  Maximize,
-  Minus,
-  Plus,
-  RotateCcw,
-  Sparkles,
-} from "lucide-react"
+import { Frame, Maximize, Minus, Plus } from "lucide-react"
 
 import {
-  DOCK_PEEK_HEIGHT,
   PhotoDock,
+  captionDateFromFile,
   makePhotoFromFile,
   type Photo,
 } from "@/components/photo-dock"
 import { Button } from "@/components/ui/button"
 import { Separator } from "@/components/ui/separator"
-import { Slider } from "@/components/ui/slider"
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "@/components/ui/tooltip"
 import { cn } from "@/lib/utils"
-
-// Initial estimate used before the dock mounts and reports its true height
-// via ResizeObserver. Doesn't need to be exact — overlay positions correct
-// themselves on the first measurement.
-const DOCK_HEIGHT_INITIAL = 184
-const OVERLAY_GAP = 8
 
 const CANVAS_WIDTH = 1600
 const CANVAS_HEIGHT = 1000
 const MIN_SCALE = 0.1
 const MAX_SCALE = 8
-const LOG_MIN = Math.log(MIN_SCALE)
-const LOG_MAX = Math.log(MAX_SCALE)
 
 type Transform = { x: number; y: number; scale: number }
 
 function clamp(v: number, min: number, max: number) {
   return Math.min(Math.max(v, min), max)
-}
-
-function scaleToSlider(s: number) {
-  return ((Math.log(s) - LOG_MIN) / (LOG_MAX - LOG_MIN)) * 100
-}
-
-function sliderToScale(v: number) {
-  return Math.exp((v / 100) * (LOG_MAX - LOG_MIN) + LOG_MIN)
 }
 
 function isTypingTarget(t: EventTarget | null) {
@@ -155,35 +123,25 @@ function useZoomPan() {
     triggerAnim()
   }, [triggerAnim])
 
-  const setSliderScale = React.useCallback(
-    (value: number) => {
-      zoomFromCenter(sliderToScale(value))
-    },
-    [zoomFromCenter]
-  )
-
   // Callback ref: measure once on attach and seed the initial transform.
   // Doing this in a ref callback (rather than an effect) avoids the
   // cascading-render pattern flagged by react-hooks/set-state-in-effect.
-  const setContainer = React.useCallback(
-    (node: HTMLDivElement | null) => {
-      containerRef.current = node
-      if (!node) return
-      const padding = 96
-      const cw = node.clientWidth
-      const ch = node.clientHeight
-      const sx = (cw - padding * 2) / CANVAS_WIDTH
-      const sy = (ch - padding * 2) / CANVAS_HEIGHT
-      const scale = clamp(Math.min(sx, sy), MIN_SCALE, MAX_SCALE)
-      setTransform({
-        scale,
-        x: (cw - CANVAS_WIDTH * scale) / 2,
-        y: (ch - CANVAS_HEIGHT * scale) / 2,
-      })
-      setMounted(true)
-    },
-    []
-  )
+  const setContainer = React.useCallback((node: HTMLDivElement | null) => {
+    containerRef.current = node
+    if (!node) return
+    const padding = 96
+    const cw = node.clientWidth
+    const ch = node.clientHeight
+    const sx = (cw - padding * 2) / CANVAS_WIDTH
+    const sy = (ch - padding * 2) / CANVAS_HEIGHT
+    const scale = clamp(Math.min(sx, sy), MIN_SCALE, MAX_SCALE)
+    setTransform({
+      scale,
+      x: (cw - CANVAS_WIDTH * scale) / 2,
+      y: (ch - CANVAS_HEIGHT * scale) / 2,
+    })
+    setMounted(true)
+  }, [])
 
   // Wheel: ctrl/meta (or trackpad pinch) zooms toward cursor; plain wheel pans.
   React.useEffect(() => {
@@ -290,7 +248,6 @@ function useZoomPan() {
     zoomOut,
     fitToView,
     reset100,
-    setSliderScale,
     onPointerDown,
   }
 }
@@ -555,11 +512,7 @@ function CanvasArtwork() {
         </filter>
       </defs>
 
-      <rect
-        width={CANVAS_WIDTH}
-        height={CANVAS_HEIGHT}
-        fill="url(#paper)"
-      />
+      <rect width={CANVAS_WIDTH} height={CANVAS_HEIGHT} fill="url(#paper)" />
 
       {/* Tapestry cells */}
       {CELLS.map((c) => (
@@ -743,112 +696,70 @@ function CanvasArtwork() {
 
 interface CanvasToolbarProps {
   scale: number
-  bottomOffset: number
   onZoomIn: () => void
   onZoomOut: () => void
   onFit: () => void
   on100: () => void
-  onSliderChange: (v: number) => void
 }
 
 function CanvasToolbar({
   scale,
-  bottomOffset,
   onZoomIn,
   onZoomOut,
   onFit,
   on100,
-  onSliderChange,
 }: CanvasToolbarProps) {
-  const sliderValue = scaleToSlider(scale)
   return (
     <div
       data-no-pan
-      style={{ bottom: bottomOffset }}
-      className="absolute left-1/2 z-20 flex -translate-x-1/2 items-center gap-1 rounded-2xl border border-border/60 bg-popover/85 px-1.5 py-1.5 shadow-xl shadow-black/15 backdrop-blur-md transition-[bottom] duration-300 ease-out"
+      className="absolute top-6 right-6 z-20 flex items-center gap-1 rounded-2xl border border-border/60 bg-popover/85 px-1.5 py-1.5 shadow-xl shadow-black/15 backdrop-blur-md"
     >
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            onClick={onZoomOut}
-            aria-label="Zoom out"
-          >
-            <Minus />
-          </Button>
-        </TooltipTrigger>
-        <TooltipContent side="top">
-          Zoom out <kbd className="ml-1 font-mono">−</kbd>
-        </TooltipContent>
-      </Tooltip>
+      <Button
+        variant="ghost"
+        size="icon-sm"
+        onClick={onZoomOut}
+        aria-label="Zoom out"
+      >
+        <Minus />
+      </Button>
 
-      <div className="flex w-44 items-center px-2">
-        <Slider
-          value={[sliderValue]}
-          min={0}
-          max={100}
-          step={0.5}
-          onValueChange={(v) => onSliderChange(v[0])}
-          aria-label="Zoom"
-        />
-      </div>
-
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            onClick={onZoomIn}
-            aria-label="Zoom in"
-          >
-            <Plus />
-          </Button>
-        </TooltipTrigger>
-        <TooltipContent side="top">
-          Zoom in <kbd className="ml-1 font-mono">+</kbd>
-        </TooltipContent>
-      </Tooltip>
-
-      <div className="ml-1 flex w-16 items-baseline justify-center font-mono text-xs tabular-nums text-muted-foreground">
+      <div className="flex w-14 items-baseline justify-center font-mono text-xs text-muted-foreground tabular-nums">
         {Math.round(scale * 100)}%
       </div>
 
-      <Separator orientation="vertical" className="mx-1 h-5" />
+      <Button
+        variant="ghost"
+        size="icon-sm"
+        onClick={onZoomIn}
+        aria-label="Zoom in"
+      >
+        <Plus />
+      </Button>
 
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={onFit}
-            data-icon="inline-start"
-          >
-            <Frame />
-            Fit
-          </Button>
-        </TooltipTrigger>
-        <TooltipContent side="top">
-          Fit canvas to view <kbd className="ml-1 font-mono">1</kbd>
-        </TooltipContent>
-      </Tooltip>
+      <Separator
+        orientation="vertical"
+        className="mx-1 h-5 data-vertical:self-center"
+      />
 
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={on100}
-            data-icon="inline-start"
-          >
-            <Maximize />
-            100%
-          </Button>
-        </TooltipTrigger>
-        <TooltipContent side="top">
-          Actual size <kbd className="ml-1 font-mono">0</kbd>
-        </TooltipContent>
-      </Tooltip>
+      <Button
+        variant="ghost"
+        size="sm"
+        onClick={onFit}
+        data-icon="inline-start"
+      >
+        <Frame />
+        Fit
+      </Button>
+
+      <Button
+        variant="ghost"
+        size="sm"
+        onClick={on100}
+        data-icon="inline-start"
+      >
+        <Maximize />
+        100%
+      </Button>
     </div>
   )
 }
@@ -866,7 +777,6 @@ export function CanvasHero() {
     zoomOut,
     fitToView,
     reset100,
-    setSliderScale,
     onPointerDown,
   } = useZoomPan()
 
@@ -875,23 +785,6 @@ export function CanvasHero() {
     null
   )
   const [isDockExpanded, setIsDockExpanded] = React.useState(false)
-  const [dockHeight, setDockHeight] = React.useState(DOCK_HEIGHT_INITIAL)
-
-  // Measure the dock's actual rendered height (excluding transforms) so the
-  // toolbar and keyboard-hint overlays sit exactly OVERLAY_GAP above its top
-  // edge — both when peeked and when expanded.
-  const setDockEl = React.useCallback((el: HTMLDivElement | null) => {
-    if (!el) return
-    setDockHeight(el.offsetHeight)
-    const ro = new ResizeObserver(() => {
-      setDockHeight(el.offsetHeight)
-    })
-    ro.observe(el)
-    return () => ro.disconnect()
-  }, [])
-
-  const overlayBottom =
-    (isDockExpanded ? dockHeight : DOCK_PEEK_HEIGHT) + OVERLAY_GAP
 
   // Blob URLs are session-scoped — revoke them when the component unmounts so
   // we don't leak memory or hold onto detached files.
@@ -906,15 +799,31 @@ export function CanvasHero() {
 
   const handleAddPhotos = React.useCallback(
     (files: File[]) => {
-      setPhotos((prev) => {
-        const next = [
-          ...prev,
-          ...files.map((f, i) => makePhotoFromFile(f, prev.length + i)),
-        ]
-        return next
+      // Create the photos up front with their filename-derived captions so they
+      // show in the dock instantly (EXIF parsing below is async).
+      const created = files.map((f, i) =>
+        makePhotoFromFile(f, photos.length + i)
+      )
+      setPhotos((prev) => [...prev, ...created])
+
+      // Then, if a photo carries a capture date in its metadata, swap its
+      // caption for that date. Matching by id means this safely no-ops when a
+      // photo was removed before its metadata resolved.
+      created.forEach((photo, i) => {
+        void captionDateFromFile(files[i]).then((dateCaption) => {
+          if (!dateCaption) return
+          setPhotos((curr) => {
+            // Photo may have been removed while its metadata was parsing;
+            // return the same reference so React skips a needless re-render.
+            if (!curr.some((p) => p.id === photo.id)) return curr
+            return curr.map((p) =>
+              p.id === photo.id ? { ...p, caption: dateCaption } : p
+            )
+          })
+        })
       })
     },
-    []
+    [photos.length]
   )
 
   const handleRemovePhoto = React.useCallback((id: string) => {
@@ -927,147 +836,82 @@ export function CanvasHero() {
   }, [])
 
   return (
-    <TooltipProvider delayDuration={250}>
-      <section className="relative h-svh w-full overflow-hidden bg-muted/60 select-none">
-        {/* Photoshop-style transparency checkerboard backdrop */}
+    <section className="relative h-svh w-full overflow-hidden bg-muted/60 select-none">
+      {/* Photoshop-style transparency checkerboard backdrop */}
+      <div
+        aria-hidden
+        className={cn(
+          "absolute inset-0",
+          "[background-image:linear-gradient(45deg,var(--border)_25%,transparent_25%),linear-gradient(-45deg,var(--border)_25%,transparent_25%),linear-gradient(45deg,transparent_75%,var(--border)_75%),linear-gradient(-45deg,transparent_75%,var(--border)_75%)]",
+          "[background-size:24px_24px]",
+          "[background-position:0_0,0_12px,12px_-12px,-12px_0]",
+          "opacity-40"
+        )}
+      />
+      {/* Vignette so the canvas commands the eye */}
+      <div
+        aria-hidden
+        className="pointer-events-none absolute inset-0 [background:radial-gradient(120%_80%_at_50%_50%,transparent_45%,oklch(0_0_0/0.18)_100%)]"
+      />
+
+      {/* Canvas viewport */}
+      <div
+        ref={setContainer}
+        onPointerDown={onPointerDown}
+        className={cn(
+          "absolute inset-0 touch-none overscroll-contain outline-none",
+          isPanning ? "cursor-grabbing" : "cursor-grab"
+        )}
+        tabIndex={0}
+      >
         <div
-          aria-hidden
+          style={{
+            width: CANVAS_WIDTH,
+            height: CANVAS_HEIGHT,
+            transform: `translate3d(${transform.x}px, ${transform.y}px, 0) scale(${transform.scale})`,
+            transformOrigin: "0 0",
+            transition: animating
+              ? "transform 240ms cubic-bezier(0.22, 1, 0.36, 1)"
+              : undefined,
+            willChange: "transform",
+            opacity: mounted ? 1 : 0,
+          }}
           className={cn(
-            "absolute inset-0",
-            "[background-image:linear-gradient(45deg,var(--border)_25%,transparent_25%),linear-gradient(-45deg,var(--border)_25%,transparent_25%),linear-gradient(45deg,transparent_75%,var(--border)_75%),linear-gradient(-45deg,transparent_75%,var(--border)_75%)]",
-            "[background-size:24px_24px]",
-            "[background-position:0_0,0_12px,12px_-12px,-12px_0]",
-            "opacity-40"
+            "shadow-2xl ring-1 shadow-black/30 ring-black/10",
+            "transition-opacity duration-300"
           )}
-        />
-        {/* Vignette so the canvas commands the eye */}
-        <div
-          aria-hidden
-          className="pointer-events-none absolute inset-0 [background:radial-gradient(120%_80%_at_50%_50%,transparent_45%,oklch(0_0_0/0.18)_100%)]"
-        />
-
-        {/* Canvas viewport */}
-        <div
-          ref={setContainer}
-          onPointerDown={onPointerDown}
-          className={cn(
-            "absolute inset-0 touch-none overscroll-contain outline-none",
-            isPanning ? "cursor-grabbing" : "cursor-grab"
-          )}
-          tabIndex={0}
         >
-          <div
-            style={{
-              width: CANVAS_WIDTH,
-              height: CANVAS_HEIGHT,
-              transform: `translate3d(${transform.x}px, ${transform.y}px, 0) scale(${transform.scale})`,
-              transformOrigin: "0 0",
-              transition: animating
-                ? "transform 240ms cubic-bezier(0.22, 1, 0.36, 1)"
-                : undefined,
-              willChange: "transform",
-              opacity: mounted ? 1 : 0,
-            }}
-            className={cn(
-              "shadow-2xl shadow-black/30 ring-1 ring-black/10",
-              "transition-opacity duration-300"
-            )}
-          >
-            <CanvasArtwork />
-          </div>
+          <CanvasArtwork />
         </div>
+      </div>
 
-        {/* Top-left brand */}
-        <div
-          data-no-pan
-          className="pointer-events-none absolute top-6 left-6 z-20 flex max-w-md flex-col gap-3"
-        >
-          <div className="pointer-events-auto inline-flex w-fit items-center gap-2 rounded-2xl border border-border/60 bg-popover/85 px-3 py-1.5 text-xs font-medium backdrop-blur-md">
-            <Sparkles className="size-3.5 text-primary" />
-            tapestry
-            <span className="text-muted-foreground/70">·</span>
-            <span className="font-mono text-muted-foreground">canvas v0.1</span>
-          </div>
-          <h1 className="text-balance text-4xl font-medium tracking-tight md:text-5xl">
-            A canvas you can fall into.
-          </h1>
-          <p className="text-balance text-base text-muted-foreground md:text-lg">
-            Scroll to pan, pinch or{" "}
-            <kbd className="rounded-md border border-border/60 bg-popover/80 px-1.5 font-mono text-xs">
-              ⌘
-            </kbd>
-            <span className="px-0.5 text-muted-foreground/60">+</span>
-            scroll to zoom, drag to move. Built with shadcn primitives.
-          </p>
-        </div>
+      {/* Top-left wordmark */}
+      <div
+        data-no-pan
+        className="absolute top-6 left-6 z-20 rounded-2xl border border-border/60 bg-popover/85 px-3 py-1.5 font-mono text-xs backdrop-blur-md"
+      >
+        Tapestry
+      </div>
 
-        {/* Top-right status panel */}
-        <div
-          data-no-pan
-          className="absolute top-6 right-6 z-20 flex items-center gap-2 rounded-2xl border border-border/60 bg-popover/85 px-2 py-1.5 backdrop-blur-md"
-        >
-          <Layers className="size-3.5 text-muted-foreground" />
-          <span className="font-mono text-xs tabular-nums">
-            {CANVAS_WIDTH} × {CANVAS_HEIGHT}
-          </span>
-          <Separator orientation="vertical" className="h-4" />
-          <span className="font-mono text-xs tabular-nums text-foreground">
-            {Math.round(transform.scale * 100)}%
-          </span>
-          <Separator orientation="vertical" className="h-4" />
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                onClick={fitToView}
-                aria-label="Reset view"
-              >
-                <RotateCcw />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent side="bottom">Reset view</TooltipContent>
-          </Tooltip>
-        </div>
+      {/* Zoom toolbar */}
+      <CanvasToolbar
+        scale={transform.scale}
+        onZoomIn={zoomIn}
+        onZoomOut={zoomOut}
+        onFit={fitToView}
+        on100={reset100}
+      />
 
-        {/* Bottom-right keyboard hints */}
-        <div
-          data-no-pan
-          style={{ bottom: overlayBottom }}
-          className="absolute right-6 z-20 hidden items-center gap-1.5 rounded-2xl border border-border/60 bg-popover/70 px-2.5 py-1.5 font-mono text-[10px] tracking-wide text-muted-foreground backdrop-blur-md transition-[bottom] duration-300 ease-out md:flex"
-        >
-          <Hand className="size-3" />
-          drag
-          <span className="text-muted-foreground/40">·</span>
-          <kbd>+</kbd>
-          <kbd>−</kbd>
-          <kbd>0</kbd>
-          <kbd>1</kbd>
-        </div>
-
-        {/* Bottom-center toolbar */}
-        <CanvasToolbar
-          scale={transform.scale}
-          bottomOffset={overlayBottom}
-          onZoomIn={zoomIn}
-          onZoomOut={zoomOut}
-          onFit={fitToView}
-          on100={reset100}
-          onSliderChange={setSliderScale}
-        />
-
-        {/* Bottom dock of polaroid photos */}
-        <PhotoDock
-          ref={setDockEl}
-          photos={photos}
-          selectedId={selectedPhotoId}
-          expanded={isDockExpanded}
-          onExpandedChange={setIsDockExpanded}
-          onAdd={handleAddPhotos}
-          onSelect={setSelectedPhotoId}
-          onRemove={handleRemovePhoto}
-        />
-      </section>
-    </TooltipProvider>
+      {/* Bottom dock of polaroid photos */}
+      <PhotoDock
+        photos={photos}
+        selectedId={selectedPhotoId}
+        expanded={isDockExpanded}
+        onExpandedChange={setIsDockExpanded}
+        onAdd={handleAddPhotos}
+        onSelect={setSelectedPhotoId}
+        onRemove={handleRemovePhoto}
+      />
+    </section>
   )
 }

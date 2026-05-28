@@ -29,8 +29,11 @@ import {
 } from "@/components/ui/tooltip"
 import { cn } from "@/lib/utils"
 
-const DOCK_HEIGHT_EXPANDED = 176
-const OVERLAY_GAP = 4
+// Initial estimate used before the dock mounts and reports its true height
+// via ResizeObserver. Doesn't need to be exact — overlay positions correct
+// themselves on the first measurement.
+const DOCK_HEIGHT_INITIAL = 184
+const OVERLAY_GAP = 8
 
 const CANVAS_WIDTH = 1600
 const CANVAS_HEIGHT = 1000
@@ -872,8 +875,23 @@ export function CanvasHero() {
     null
   )
   const [isDockExpanded, setIsDockExpanded] = React.useState(false)
+  const [dockHeight, setDockHeight] = React.useState(DOCK_HEIGHT_INITIAL)
+
+  // Measure the dock's actual rendered height (excluding transforms) so the
+  // toolbar and keyboard-hint overlays sit exactly OVERLAY_GAP above its top
+  // edge — both when peeked and when expanded.
+  const setDockEl = React.useCallback((el: HTMLDivElement | null) => {
+    if (!el) return
+    setDockHeight(el.offsetHeight)
+    const ro = new ResizeObserver(() => {
+      setDockHeight(el.offsetHeight)
+    })
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+
   const overlayBottom =
-    (isDockExpanded ? DOCK_HEIGHT_EXPANDED : DOCK_PEEK_HEIGHT) + OVERLAY_GAP
+    (isDockExpanded ? dockHeight : DOCK_PEEK_HEIGHT) + OVERLAY_GAP
 
   // Blob URLs are session-scoped — revoke them when the component unmounts so
   // we don't leak memory or hold onto detached files.
@@ -1040,6 +1058,7 @@ export function CanvasHero() {
 
         {/* Bottom dock of polaroid photos */}
         <PhotoDock
+          ref={setDockEl}
           photos={photos}
           selectedId={selectedPhotoId}
           expanded={isDockExpanded}

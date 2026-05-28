@@ -50,6 +50,7 @@ export function makePhotoFromFile(file: File, index: number): Photo {
 }
 
 interface PhotoDockProps {
+  ref?: React.Ref<HTMLDivElement>
   photos: Photo[]
   selectedId: string | null
   expanded: boolean
@@ -60,6 +61,7 @@ interface PhotoDockProps {
 }
 
 export function PhotoDock({
+  ref,
   photos,
   selectedId,
   expanded,
@@ -106,6 +108,7 @@ export function PhotoDock({
 
   return (
     <div
+      ref={ref}
       data-no-pan
       onMouseEnter={() => {
         triggers.current.hover = true
@@ -308,7 +311,7 @@ function AddPhotoTile({ onClick }: { onClick: () => void }) {
       aria-label="Add photos"
       className={cn(
         "group grid shrink-0 snap-center",
-        "h-[124px] w-[100px] place-items-center",
+        "h-[134px] w-[100px] place-items-center",
         "border border-dashed border-border/80 bg-popover/40",
         "text-muted-foreground transition-colors",
         "hover:border-foreground/60 hover:text-foreground"
@@ -326,7 +329,7 @@ function AddPhotoTile({ onClick }: { onClick: () => void }) {
 
 function EmptyHint() {
   return (
-    <div className="flex h-[124px] flex-1 items-center justify-center font-mono text-[11px] tracking-wide text-muted-foreground italic">
+    <div className="flex h-[134px] flex-1 items-center justify-center font-mono text-[11px] tracking-wide text-muted-foreground italic">
       drop photos here, or click + to add
     </div>
   )

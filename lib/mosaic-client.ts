@@ -73,12 +73,15 @@ export class MosaicEngine {
     cellSigs: Float32Array[],
     grid: Grid,
     ids: string[],
+    angles: Float32Array,
     onFrame?: GenerateFrameCallback
   ): Promise<GenerateResult> {
     const reqId = ++this.reqId
     return new Promise((resolve) => {
       this.pending.set(reqId, { resolve, onFrame })
-      this.send({ type: "generate", reqId, cellSigs, grid, ids })
+      // `angles` is sent (cloned, not transferred) so the caller keeps its copy
+      // for the crisp zoom overlay.
+      this.send({ type: "generate", reqId, cellSigs, grid, ids, angles })
     })
   }
 

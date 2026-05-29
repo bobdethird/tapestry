@@ -14,6 +14,10 @@ export type WorkerRequest =
       cellSigs: Float32Array[]
       grid: Grid
       ids: string[]
+      // Per-cell edge orientation (radians) so the worker can rotate each tile's
+      // photo along the reference's contours. The warped mesh itself is derived
+      // deterministically from the grid on both sides.
+      angles: Float32Array
     }
   | { type: "drop"; ids: string[] }
   | { type: "clear" }

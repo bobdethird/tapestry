@@ -19,10 +19,12 @@ import { Separator } from "@/components/ui/separator"
 import { Slider } from "@/components/ui/slider"
 import { MosaicEngine } from "@/lib/mosaic-client"
 import {
-  drawMosaicRegion,
+  drawWarpedMosaicRegion,
   gridForCellSize,
   loadImage,
+  referenceCellOrientations,
   referenceCellSignatures,
+  warpedGridVertices,
   type Grid,
 } from "@/lib/mosaic"
 import { cn } from "@/lib/utils"
@@ -838,6 +840,8 @@ export function CanvasHero() {
   const mosaicModelRef = React.useRef<{
     grid: Grid
     assignment: Int32Array
+    angles: Float32Array
+    verts: Float32Array
     thumbUrls: string[]
   } | null>(null)
   // Bumped whenever the mosaic is (re)generated or cleared, so the crisp-overlay
@@ -987,6 +991,12 @@ export function CanvasHero() {
       const refImg = await loadImage(ref.url)
       const grid = gridForCellSize(density, CANVAS_WIDTH, CANVAS_HEIGHT)
       const cellSigs = referenceCellSignatures(refImg, grid)
+      // Per-cell edge orientation so each tile is rotated to follow the
+      // reference's contours.
+      const angles = referenceCellOrientations(refImg, grid)
+      // Warped mesh: irregular quads that tessellate (no white gaps). Computed
+      // deterministically here for the zoom overlay; the worker mirrors it.
+      const verts = warpedGridVertices(grid, CANVAS_WIDTH, CANVAS_HEIGHT)
       const ids = ready.map((p) => p.id)
       const thumbUrls = ready.map((p) => p.thumbUrl as string)
       // The worker matches tiles to cells and renders the base mosaic, streaming
@@ -996,6 +1006,7 @@ export function CanvasHero() {
         cellSigs,
         grid,
         ids,
+        angles,
         (frame, doneCells, totalCells) => {
           // Ignore frames from a superseded generate.
           if (token !== generateTokenRef.current) {
@@ -1016,7 +1027,7 @@ export function CanvasHero() {
       base.close()
       // Keep the render model so the crisp overlay can repaint visible tiles
       // from their thumbnails as the user zooms in.
-      mosaicModelRef.current = { grid, assignment, thumbUrls }
+      mosaicModelRef.current = { grid, assignment, angles, verts, thumbUrls }
       setMosaicVersion((v) => v + 1)
       setHasMosaic(true)
     } catch {
@@ -1086,7 +1097,7 @@ export function CanvasHero() {
       const cssH = canvas.clientHeight
       if (!cssW || !cssH) return
 
-      const { grid, assignment, thumbUrls } = model
+      const { grid, assignment, angles, verts, thumbUrls } = model
       const region = {
         x: -t.x / t.scale,
         y: -t.y / t.scale,
@@ -1095,10 +1106,12 @@ export function CanvasHero() {
       }
       const cw = CANVAS_WIDTH / grid.cols
       const ch = CANVAS_HEIGHT / grid.rows
-      const colStart = Math.max(0, Math.floor(region.x / cw))
-      const colEnd = Math.min(grid.cols - 1, Math.floor((region.x + region.w) / cw))
-      const rowStart = Math.max(0, Math.floor(region.y / ch))
-      const rowEnd = Math.min(grid.rows - 1, Math.floor((region.y + region.h) / ch))
+      // Widen by one cell to match drawWarpedMosaicRegion, so warped quads that
+      // spill in from just outside the region still get their tiles decoded.
+      const colStart = Math.max(0, Math.floor(region.x / cw) - 1)
+      const colEnd = Math.min(grid.cols - 1, Math.floor((region.x + region.w) / cw) + 1)
+      const rowStart = Math.max(0, Math.floor(region.y / ch) - 1)
+      const rowEnd = Math.min(grid.rows - 1, Math.floor((region.y + region.h) / ch) + 1)
       if (colEnd < colStart || rowEnd < rowStart) return
 
       // Decode only the tiles visible in this region.
@@ -1132,14 +1145,16 @@ export function CanvasHero() {
       ctx.setTransform(dpr * t.scale, 0, 0, dpr * t.scale, dpr * t.x, dpr * t.y)
       ctx.imageSmoothingEnabled = true
       ctx.imageSmoothingQuality = "high"
-      drawMosaicRegion(
+      drawWarpedMosaicRegion(
         ctx,
         grid,
         assignment,
+        angles,
         tiles,
         CANVAS_WIDTH,
         CANVAS_HEIGHT,
-        region
+        region,
+        verts
       )
     },
     [ensureThumb]

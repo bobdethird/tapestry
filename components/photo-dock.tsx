@@ -2,21 +2,33 @@
 
 import * as React from "react"
 import { Images, Plus, X } from "lucide-react"
-import exifr from "exifr"
 
 import { Separator } from "@/components/ui/separator"
 import { cn } from "@/lib/utils"
 
 export type Photo = {
   id: string
-  url: string
+  // Object URL of the worker-generated thumbnail. Undefined while the photo is
+  // still being indexed, or if it couldn't be decoded.
+  thumbUrl?: string
   rotation: number
   caption: string
+  status: "pending" | "ready"
 }
 
 // How much of the dock peeks above the viewport bottom when collapsed.
 // Exported so the canvas can position its floating toolbar to match.
 export const DOCK_PEEK_HEIGHT = 32
+
+// Fixed geometry for the virtualized row. Cards are uniform width so we can map
+// scroll position to a visible slice and only mount what's on screen.
+const CARD_WIDTH = 100
+const CARD_GAP = 16
+const SLOT = CARD_WIDTH + CARD_GAP
+const TRACK_PAD = 24
+const TRACK_HEIGHT = 168
+const CARD_BOTTOM = 16
+const OVERSCAN = 6
 
 // Deterministic rotations so polaroids don't jitter on re-render
 const TILT_PATTERN = [-4, 3, -2, 5, -3, 2, -5, 4, -1, 3, -3, 2]
@@ -36,45 +48,14 @@ function captionFromFile(file: File) {
   )
 }
 
-// Format a capture date as a compact MM/DD/YY caption, e.g. "05/28/26".
-function formatDateCaption(date: Date) {
-  return date.toLocaleDateString("en-US", {
-    month: "2-digit",
-    day: "2-digit",
-    year: "2-digit",
-  })
-}
-
-// Read a photo's capture date from EXIF metadata, preferring when the shutter
-// fired (DateTimeOriginal) and falling back through the other date tags.
-// Resolves to a formatted caption, or null when there's no usable date — no
-// EXIF, an unsupported format, or a parse failure — so callers keep using the
-// filename caption. Runs client-side; exifr reads the file bytes directly.
-export async function captionDateFromFile(file: File): Promise<string | null> {
-  try {
-    const exif = await exifr.parse(file, [
-      "DateTimeOriginal",
-      "CreateDate",
-      "ModifyDate",
-    ])
-    const raw = exif?.DateTimeOriginal ?? exif?.CreateDate ?? exif?.ModifyDate
-    if (!raw) return null
-    // exifr revives these tags to Date objects (in local time), but returns the
-    // raw string if it can't parse them — coerce and validate either way.
-    const date = raw instanceof Date ? raw : new Date(raw)
-    if (Number.isNaN(date.getTime())) return null
-    return formatDateCaption(date)
-  } catch {
-    return null
-  }
-}
-
+// Create a pending photo immediately so it shows in the dock while the worker
+// decodes it. The thumbnail and EXIF caption fill in via the ingest callback.
 export function makePhotoFromFile(file: File, index: number): Photo {
   return {
     id: crypto.randomUUID(),
-    url: URL.createObjectURL(file),
     rotation: tiltForIndex(index),
     caption: captionFromFile(file),
+    status: "pending",
   }
 }
 
@@ -83,6 +64,7 @@ interface PhotoDockProps {
   photos: Photo[]
   selectedId: string | null
   expanded: boolean
+  ingest?: { done: number; total: number }
   onExpandedChange: (next: boolean) => void
   onAdd: (files: File[]) => void
   onSelect: (id: string) => void
@@ -94,6 +76,7 @@ export function PhotoDock({
   photos,
   selectedId,
   expanded,
+  ingest,
   onExpandedChange,
   onAdd,
   onSelect,
@@ -102,6 +85,8 @@ export function PhotoDock({
   const inputRef = React.useRef<HTMLInputElement>(null)
   const scrollRef = React.useRef<HTMLDivElement>(null)
   const [isDragOver, setIsDragOver] = React.useState(false)
+  const [scrollLeft, setScrollLeft] = React.useState(0)
+  const [viewportW, setViewportW] = React.useState(0)
 
   // Track each independent "reason to stay open" so they don't collide.
   // Drag uses a depth counter for nested dragenter/leave events on children.
@@ -134,6 +119,30 @@ export function PhotoDock({
     el.addEventListener("wheel", onWheel, { passive: false })
     return () => el.removeEventListener("wheel", onWheel)
   }, [])
+
+  // Keep the visible window in sync with the scroller's width.
+  React.useEffect(() => {
+    const el = scrollRef.current
+    if (!el) return
+    const ro = new ResizeObserver(() => setViewportW(el.clientWidth))
+    ro.observe(el)
+    setViewportW(el.clientWidth)
+    return () => ro.disconnect()
+  }, [])
+
+  const count = photos.length
+  const trackWidth = TRACK_PAD * 2 + count * SLOT + CARD_WIDTH
+  // Inclusive index range of cards to actually render (plus overscan).
+  const first = Math.max(0, Math.floor((scrollLeft - TRACK_PAD) / SLOT) - OVERSCAN)
+  const last = Math.min(
+    count - 1,
+    Math.ceil((scrollLeft + viewportW - TRACK_PAD) / SLOT) + OVERSCAN
+  )
+
+  const visible: number[] = []
+  for (let i = first; i <= last; i++) visible.push(i)
+
+  const indexing = ingest && ingest.total > 0 && ingest.done < ingest.total
 
   return (
     <div
@@ -198,9 +207,15 @@ export function PhotoDock({
           <Images className="size-3" />
           photos
           <Separator orientation="vertical" className="h-3" />
-          <span className="text-foreground/80 tabular-nums">
-            {photos.length}
-          </span>
+          <span className="text-foreground/80 tabular-nums">{count}</span>
+          {indexing && (
+            <>
+              <Separator orientation="vertical" className="h-3" />
+              <span className="text-foreground/60 tabular-nums normal-case">
+                indexing {ingest!.done}/{ingest!.total}
+              </span>
+            </>
+          )}
         </div>
         <button
           type="button"
@@ -223,26 +238,50 @@ export function PhotoDock({
 
         <div
           ref={scrollRef}
+          onScroll={(e) => setScrollLeft(e.currentTarget.scrollLeft)}
           className={cn(
-            "flex items-end gap-4 overflow-x-auto px-6 pt-3 pb-3",
-            "snap-x [scrollbar-width:thin]",
+            "overflow-x-auto overflow-y-hidden",
+            "[scrollbar-width:thin]",
             "[scrollbar-color:var(--border)_transparent]"
           )}
         >
-          {photos.length === 0 ? (
-            <EmptyHint />
+          {count === 0 ? (
+            <div className="px-6 py-3">
+              <EmptyHint />
+            </div>
           ) : (
-            photos.map((p) => (
-              <PolaroidCard
-                key={p.id}
-                photo={p}
-                selected={p.id === selectedId}
-                onClick={() => onSelect(p.id)}
-                onRemove={() => onRemove(p.id)}
-              />
-            ))
+            <div
+              className="relative"
+              style={{ width: trackWidth, height: TRACK_HEIGHT }}
+            >
+              {visible.map((i) => {
+                const p = photos[i]
+                return (
+                  <div
+                    key={p.id}
+                    className="absolute"
+                    style={{
+                      left: TRACK_PAD + i * SLOT,
+                      bottom: CARD_BOTTOM,
+                    }}
+                  >
+                    <PolaroidCard
+                      photo={p}
+                      selected={p.id === selectedId}
+                      onClick={() => onSelect(p.id)}
+                      onRemove={() => onRemove(p.id)}
+                    />
+                  </div>
+                )
+              })}
+              <div
+                className="absolute"
+                style={{ left: TRACK_PAD + count * SLOT, bottom: CARD_BOTTOM }}
+              >
+                <AddPhotoTile onClick={() => inputRef.current?.click()} />
+              </div>
+            </div>
           )}
-          <AddPhotoTile onClick={() => inputRef.current?.click()} />
         </div>
       </div>
 
@@ -276,7 +315,7 @@ function PolaroidCard({
     <div
       style={{ rotate: `${photo.rotation}deg` }}
       className={cn(
-        "group relative shrink-0 snap-center transition-transform duration-200 ease-out",
+        "group relative shrink-0 transition-transform duration-200 ease-out",
         "hover:-translate-y-1.5 hover:[rotate:0deg]",
         selected && "-translate-y-2 [rotate:0deg]"
       )}
@@ -294,13 +333,26 @@ function PolaroidCard({
         )}
       >
         <div className="relative size-20 overflow-hidden bg-stone-100">
-          {/* eslint-disable-next-line @next/next/no-img-element -- user-uploaded blob URLs don't benefit from next/image optimization */}
-          <img
-            src={photo.url}
-            alt={photo.caption}
-            className="size-full object-cover"
-            draggable={false}
-          />
+          {photo.thumbUrl ? (
+            /* eslint-disable-next-line @next/next/no-img-element -- user-uploaded blob URLs don't benefit from next/image optimization */
+            <img
+              src={photo.thumbUrl}
+              alt={photo.caption}
+              className="size-full object-cover"
+              loading="lazy"
+              decoding="async"
+              draggable={false}
+            />
+          ) : (
+            <div
+              className={cn(
+                "size-full",
+                photo.status === "pending"
+                  ? "animate-pulse bg-stone-200"
+                  : "bg-stone-200"
+              )}
+            />
+          )}
         </div>
         <div className="mt-1.5 w-20 truncate text-center font-mono text-[9px] tracking-wide text-stone-600 italic">
           {photo.caption}
@@ -334,7 +386,7 @@ function AddPhotoTile({ onClick }: { onClick: () => void }) {
       onClick={onClick}
       aria-label="Add photos"
       className={cn(
-        "group grid shrink-0 snap-center",
+        "group grid shrink-0",
         "h-[134px] w-[100px] place-items-center",
         "border border-dashed border-border/80 bg-popover/40",
         "text-muted-foreground transition-colors",
@@ -343,9 +395,7 @@ function AddPhotoTile({ onClick }: { onClick: () => void }) {
     >
       <div className="flex flex-col items-center gap-1">
         <Plus className="size-4 transition-transform group-hover:scale-110" />
-        <span className="font-mono text-[9px] tracking-wider uppercase">
-          add
-        </span>
+        <span className="font-mono text-[9px] tracking-wider uppercase">add</span>
       </div>
     </button>
   )

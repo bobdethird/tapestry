@@ -5,7 +5,6 @@ import { Frame, Maximize, Minus, Plus, Sparkles } from "lucide-react"
 
 import {
   PhotoDock,
-  captionDateFromFile,
   makePhotoFromFile,
   type Photo,
 } from "@/components/photo-dock"
@@ -18,13 +17,13 @@ import {
 import { Button } from "@/components/ui/button"
 import { Separator } from "@/components/ui/separator"
 import { Slider } from "@/components/ui/slider"
+import { MosaicEngine } from "@/lib/mosaic-client"
 import {
-  assignTiles,
-  drawMosaic,
+  drawMosaicRegion,
   gridForCellSize,
   loadImage,
   referenceCellSignatures,
-  signatureOf,
+  type Grid,
 } from "@/lib/mosaic"
 import { cn } from "@/lib/utils"
 
@@ -36,6 +35,16 @@ const MAX_SCALE = 8
 // Mosaic cell size in px (within the 1600x1000 frame). Smaller = finer grid.
 const DENSITY_MIN = 16
 const DENSITY_MAX = 80
+
+// Once zoomed past this scale we re-render the visible tiles from their
+// full-resolution sources so the constituent photos stay sharp instead of
+// upscaling the baked-in low-res canvas.
+const CRISP_SCALE = 1.5
+// Delay before painting the crisp overlay, so it only fires once a zoom/pan
+// gesture settles rather than on every intermediate frame.
+const CRISP_SETTLE_MS = 120
+// Cap on decoded thumbnail bitmaps kept for the crisp overlay (bounded memory).
+const CRISP_CACHE_MAX = 300
 
 type Transform = { x: number; y: number; scale: number }
 
@@ -808,22 +817,88 @@ export function CanvasHero() {
   const [density, setDensity] = React.useState(40)
   const [isGenerating, setIsGenerating] = React.useState(false)
   const [hasMosaic, setHasMosaic] = React.useState(false)
+  // Cumulative ingest progress reported by the worker (done/total photos).
+  const [ingestProgress, setIngestProgress] = React.useState({
+    done: 0,
+    total: 0,
+  })
+  // Live generate progress (cells matched / total) while the mosaic fills in.
+  const [generateProgress, setGenerateProgress] = React.useState<{
+    done: number
+    total: number
+  } | null>(null)
   const mosaicCanvasRef = React.useRef<HTMLCanvasElement | null>(null)
-  // Cache each tile's decoded image + signature by photo id. The signature size
-  // is fixed, so it survives density changes; only new photos need decoding.
-  const tileCacheRef = React.useRef<
-    Map<string, { img: HTMLImageElement; sig: Float32Array }>
-  >(new Map())
+  // High-resolution overlay, pinned to the viewport. When zoomed in we paint the
+  // visible tiles into it at device resolution so the photos read sharply.
+  const crispCanvasRef = React.useRef<HTMLCanvasElement | null>(null)
+  // What the crisp overlay needs to re-paint the visible mosaic on zoom: the
+  // grid, the per-cell tile assignment (indices into thumbUrls), and the tile
+  // thumbnail URLs. No full-resolution images are held — that's what lets this
+  // scale to thousands of photos.
+  const mosaicModelRef = React.useRef<{
+    grid: Grid
+    assignment: Int32Array
+    thumbUrls: string[]
+  } | null>(null)
+  // Bumped whenever the mosaic is (re)generated or cleared, so the crisp-overlay
+  // effect re-runs even when the zoom transform itself hasn't changed.
+  const [mosaicVersion, setMosaicVersion] = React.useState(0)
+  // Bounded LRU (oldest first) of decoded overlay thumbnails, keyed by URL.
+  const crispCacheRef = React.useRef<Map<string, HTMLImageElement>>(new Map())
+  // Worker handle: decode + signature + tile matching + base-canvas render.
+  const engineRef = React.useRef<MosaicEngine | null>(null)
+  // Mirror of photos so worker callbacks and generate read the latest list
+  // without re-subscribing on every change.
+  const photosRef = React.useRef<Photo[]>(photos)
+  React.useEffect(() => {
+    photosRef.current = photos
+  }, [photos])
+  // Monotonic token so a superseded generate (rapid density tweaks) is discarded
+  // rather than overwriting a newer result.
+  const generateTokenRef = React.useRef(0)
 
-  // Blob URLs are session-scoped — revoke them when the component unmounts so
-  // we don't leak memory or hold onto detached files.
+  // Thumbnail object URLs are session-scoped — revoke them on unmount. Per-photo
+  // revocation otherwise happens in handleRemovePhoto / the ingest callback.
   React.useEffect(() => {
     return () => {
-      photos.forEach((p) => URL.revokeObjectURL(p.url))
+      photosRef.current.forEach(
+        (p) => p.thumbUrl && URL.revokeObjectURL(p.thumbUrl)
+      )
     }
-    // We intentionally only run this on unmount; per-photo revocation happens
-    // in handleRemove.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Spin up the mosaic worker once on mount. It owns decoding, signature
+  // extraction, tile matching, and base-canvas rendering, keeping the main
+  // thread responsive with thousands of photos.
+  React.useEffect(() => {
+    const engine = new MosaicEngine()
+    engineRef.current = engine
+    engine.onIngested = ({ id, thumb, dateCaption }) => {
+      const url = thumb ? URL.createObjectURL(thumb) : undefined
+      setPhotos((curr) => {
+        const idx = curr.findIndex((p) => p.id === id)
+        if (idx === -1) {
+          // Photo was removed mid-ingest — drop the freshly-made URL.
+          if (url) URL.revokeObjectURL(url)
+          return curr
+        }
+        const next = curr.slice()
+        const prev = next[idx]
+        if (prev.thumbUrl) URL.revokeObjectURL(prev.thumbUrl)
+        next[idx] = {
+          ...prev,
+          thumbUrl: url,
+          status: "ready",
+          caption: dateCaption ?? prev.caption,
+        }
+        return next
+      })
+    }
+    engine.onProgress = (done, total) => setIngestProgress({ done, total })
+    return () => {
+      engine.terminate()
+      engineRef.current = null
+    }
   }, [])
 
   // Keep a ref in sync so the unmount cleanup can revoke the *current* reference
@@ -838,39 +913,23 @@ export function CanvasHero() {
     }
   }, [])
 
-  const handleAddPhotos = React.useCallback(
-    (files: File[]) => {
-      // Create the photos up front with their filename-derived captions so they
-      // show in the dock instantly (EXIF parsing below is async).
-      const created = files.map((f, i) =>
-        makePhotoFromFile(f, photos.length + i)
-      )
-      setPhotos((prev) => [...prev, ...created])
-
-      // Then, if a photo carries a capture date in its metadata, swap its
-      // caption for that date. Matching by id means this safely no-ops when a
-      // photo was removed before its metadata resolved.
-      created.forEach((photo, i) => {
-        void captionDateFromFile(files[i]).then((dateCaption) => {
-          if (!dateCaption) return
-          setPhotos((curr) => {
-            // Photo may have been removed while its metadata was parsing;
-            // return the same reference so React skips a needless re-render.
-            if (!curr.some((p) => p.id === photo.id)) return curr
-            return curr.map((p) =>
-              p.id === photo.id ? { ...p, caption: dateCaption } : p
-            )
-          })
-        })
-      })
-    },
-    [photos.length]
-  )
+  const handleAddPhotos = React.useCallback((files: File[]) => {
+    // Show pending photos immediately; the worker streams back thumbnails and
+    // EXIF captions as it indexes them. Originals are handed to the worker and
+    // not retained on the main thread.
+    const base = photosRef.current.length
+    const created = files.map((f, i) => makePhotoFromFile(f, base + i))
+    setPhotos((prev) => [...prev, ...created])
+    engineRef.current?.ingest(
+      created.map((p, i) => ({ id: p.id, blob: files[i] }))
+    )
+  }, [])
 
   const handleRemovePhoto = React.useCallback((id: string) => {
+    engineRef.current?.drop([id])
     setPhotos((prev) => {
       const target = prev.find((p) => p.id === id)
-      if (target) URL.revokeObjectURL(target.url)
+      if (target?.thumbUrl) URL.revokeObjectURL(target.thumbUrl)
       return prev.filter((p) => p.id !== id)
     })
     setSelectedPhotoId((curr) => (curr === id ? null : curr))
@@ -885,6 +944,8 @@ export function CanvasHero() {
       })
       // A new reference invalidates any existing mosaic — back to a white canvas.
       setHasMosaic(false)
+      mosaicModelRef.current = null
+      setMosaicVersion((v) => v + 1)
       mosaicCanvasRef.current
         ?.getContext("2d")
         ?.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT)
@@ -899,51 +960,74 @@ export function CanvasHero() {
       return null
     })
     setHasMosaic(false)
+    mosaicModelRef.current = null
+    setMosaicVersion((v) => v + 1)
   }, [])
 
   const handleGenerate = React.useCallback(async () => {
     const ref = referenceRef.current
-    if (!ref || photos.length === 0) return
+    const engine = engineRef.current
+    if (!ref || !engine) return
+    const ready = photosRef.current.filter(
+      (p) => p.status === "ready" && p.thumbUrl
+    )
+    if (ready.length === 0) return
+    const token = ++generateTokenRef.current
     setIsGenerating(true)
-    try {
-      const refImg = await loadImage(ref.url)
-      // Decode + sign each tile once; cache by id so density tweaks stay cheap.
-      const tiles = await Promise.all(
-        photos.map(async (p) => {
-          const cached = tileCacheRef.current.get(p.id)
-          if (cached) return cached
-          const img = await loadImage(p.url)
-          const entry = { img, sig: signatureOf(img) }
-          tileCacheRef.current.set(p.id, entry)
-          return entry
-        })
-      )
-      const grid = gridForCellSize(density, CANVAS_WIDTH, CANVAS_HEIGHT)
-      const cellSigs = referenceCellSignatures(refImg, grid)
-      const assignment = assignTiles(
-        cellSigs,
-        tiles.map((t) => t.sig)
-      )
+    setGenerateProgress(null)
+    // Paint a worker-rendered frame (final or in-progress) onto the canvas.
+    const blit = (frame: ImageBitmap) => {
       const ctx = mosaicCanvasRef.current?.getContext("2d")
       if (ctx) {
-        ctx.fillStyle = "#ffffff"
-        ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT)
-        drawMosaic(
-          ctx,
-          grid,
-          assignment,
-          tiles.map((t) => t.img),
-          CANVAS_WIDTH,
-          CANVAS_HEIGHT
-        )
+        ctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT)
+        ctx.drawImage(frame, 0, 0)
       }
+    }
+    try {
+      const refImg = await loadImage(ref.url)
+      const grid = gridForCellSize(density, CANVAS_WIDTH, CANVAS_HEIGHT)
+      const cellSigs = referenceCellSignatures(refImg, grid)
+      const ids = ready.map((p) => p.id)
+      const thumbUrls = ready.map((p) => p.thumbUrl as string)
+      // The worker matches tiles to cells and renders the base mosaic, streaming
+      // in-progress snapshots so the user watches it fill in. No full-res images
+      // touch the main thread.
+      const { assignment, base } = await engine.generate(
+        cellSigs,
+        grid,
+        ids,
+        (frame, doneCells, totalCells) => {
+          // Ignore frames from a superseded generate.
+          if (token !== generateTokenRef.current) {
+            frame.close()
+            return
+          }
+          blit(frame)
+          frame.close()
+          setGenerateProgress({ done: doneCells, total: totalCells })
+        }
+      )
+      // A newer generate started while we awaited — discard this stale result.
+      if (token !== generateTokenRef.current) {
+        base.close()
+        return
+      }
+      blit(base)
+      base.close()
+      // Keep the render model so the crisp overlay can repaint visible tiles
+      // from their thumbnails as the user zooms in.
+      mosaicModelRef.current = { grid, assignment, thumbUrls }
+      setMosaicVersion((v) => v + 1)
       setHasMosaic(true)
     } catch {
-      // Generation failed (e.g. a tile couldn't decode) — keep the prior canvas.
+      // Generation failed — keep the prior canvas.
     } finally {
-      setIsGenerating(false)
+      if (token === generateTokenRef.current) {
+        setIsGenerating(false)
+        setGenerateProgress(null)
+      }
     }
-  }, [photos, density])
+  }, [density])
 
   // Keep the latest generator in a ref so the live-density effect can call it
   // without resubscribing on every render.
@@ -960,6 +1044,131 @@ export function CanvasHero() {
     return () => window.clearTimeout(id)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [density])
+
+  // Decode a thumbnail into an HTMLImageElement, memoized in a bounded LRU so
+  // repeated overlay renders don't re-decode and memory stays flat.
+  const ensureThumb = React.useCallback(
+    async (url: string): Promise<HTMLImageElement | null> => {
+      const cache = crispCacheRef.current
+      const hit = cache.get(url)
+      if (hit) {
+        // Touch: move to most-recently-used.
+        cache.delete(url)
+        cache.set(url, hit)
+        return hit
+      }
+      try {
+        const img = await loadImage(url)
+        cache.set(url, img)
+        while (cache.size > CRISP_CACHE_MAX) {
+          const oldest = cache.keys().next().value
+          if (oldest === undefined) break
+          cache.delete(oldest)
+        }
+        return img
+      } catch {
+        return null
+      }
+    },
+    []
+  )
+
+  // Paint the currently-visible tiles into the viewport overlay at device
+  // resolution from their thumbnails. Work is bounded to the visible region, so
+  // cost/memory stay flat regardless of zoom level or photo count. Async because
+  // the needed thumbnails are decoded on demand.
+  const renderCrisp = React.useCallback(
+    async (t: Transform, isCancelled: () => boolean) => {
+      const canvas = crispCanvasRef.current
+      const model = mosaicModelRef.current
+      if (!canvas || !model) return
+      const cssW = canvas.clientWidth
+      const cssH = canvas.clientHeight
+      if (!cssW || !cssH) return
+
+      const { grid, assignment, thumbUrls } = model
+      const region = {
+        x: -t.x / t.scale,
+        y: -t.y / t.scale,
+        w: cssW / t.scale,
+        h: cssH / t.scale,
+      }
+      const cw = CANVAS_WIDTH / grid.cols
+      const ch = CANVAS_HEIGHT / grid.rows
+      const colStart = Math.max(0, Math.floor(region.x / cw))
+      const colEnd = Math.min(grid.cols - 1, Math.floor((region.x + region.w) / cw))
+      const rowStart = Math.max(0, Math.floor(region.y / ch))
+      const rowEnd = Math.min(grid.rows - 1, Math.floor((region.y + region.h) / ch))
+      if (colEnd < colStart || rowEnd < rowStart) return
+
+      // Decode only the tiles visible in this region.
+      const needed = new Set<number>()
+      for (let row = rowStart; row <= rowEnd; row++) {
+        for (let col = colStart; col <= colEnd; col++) {
+          needed.add(assignment[row * grid.cols + col])
+        }
+      }
+      const tiles: (HTMLImageElement | null)[] = new Array(thumbUrls.length)
+      await Promise.all(
+        [...needed].map(async (idx) => {
+          const url = thumbUrls[idx]
+          if (url) tiles[idx] = await ensureThumb(url)
+        })
+      )
+      // Bail if the view moved on while we were decoding.
+      if (isCancelled()) return
+
+      const dpr = window.devicePixelRatio || 1
+      const bw = Math.round(cssW * dpr)
+      const bh = Math.round(cssH * dpr)
+      if (canvas.width !== bw) canvas.width = bw
+      if (canvas.height !== bh) canvas.height = bh
+      const ctx = canvas.getContext("2d")
+      if (!ctx) return
+      ctx.setTransform(1, 0, 0, 1, 0, 0)
+      ctx.clearRect(0, 0, bw, bh)
+      // Map mosaic-content space → device pixels (DPR · the live pan/zoom). This
+      // mirrors the CSS transform on the base canvas so the overlay lines up.
+      ctx.setTransform(dpr * t.scale, 0, 0, dpr * t.scale, dpr * t.x, dpr * t.y)
+      ctx.imageSmoothingEnabled = true
+      ctx.imageSmoothingQuality = "high"
+      drawMosaicRegion(
+        ctx,
+        grid,
+        assignment,
+        tiles,
+        CANVAS_WIDTH,
+        CANVAS_HEIGHT,
+        region
+      )
+    },
+    [ensureThumb]
+  )
+
+  // Reveal the crisp overlay once a zoomed-in view settles; hide it instantly
+  // during interaction so the GPU-scaled base canvas tracks gestures smoothly.
+  // While a button-zoom animation is running we hold off — re-running when it
+  // ends — so the overlay sharpens in only after the motion completes.
+  React.useEffect(() => {
+    const canvas = crispCanvasRef.current
+    if (!canvas) return
+    canvas.style.transition = "none"
+    canvas.style.opacity = "0"
+    if (!mosaicModelRef.current || transform.scale < CRISP_SCALE || animating)
+      return
+    let cancelled = false
+    const id = window.setTimeout(() => {
+      void renderCrisp(transform, () => cancelled).then(() => {
+        if (cancelled) return
+        canvas.style.transition = "opacity 160ms ease-out"
+        canvas.style.opacity = "1"
+      })
+    }, CRISP_SETTLE_MS)
+    return () => {
+      cancelled = true
+      window.clearTimeout(id)
+    }
+  }, [transform, mosaicVersion, animating, renderCrisp])
 
   // Paste an image from the clipboard to set or replace the reference.
   React.useEffect(() => {
@@ -981,6 +1190,13 @@ export function CanvasHero() {
     window.addEventListener("paste", onPaste)
     return () => window.removeEventListener("paste", onPaste)
   }, [handleSetReference])
+
+  const readyCount = photos.reduce(
+    (n, p) => (p.status === "ready" && p.thumbUrl ? n + 1 : n),
+    0
+  )
+  const isIndexing =
+    ingestProgress.total > 0 && ingestProgress.done < ingestProgress.total
 
   return (
     <section className="relative h-svh w-full overflow-hidden bg-muted/60 select-none">
@@ -1039,6 +1255,18 @@ export function CanvasHero() {
             <CanvasArtwork />
           )}
         </div>
+
+        {/* Full-resolution overlay: pinned to the viewport (not the transformed
+            frame) and painted only when zoomed in, so the photos that make up
+            the mosaic stay sharp. Transparent + non-interactive otherwise. */}
+        {reference && (
+          <canvas
+            ref={crispCanvasRef}
+            aria-hidden
+            className="pointer-events-none absolute inset-0 size-full"
+            style={{ opacity: 0 }}
+          />
+        )}
       </div>
 
       {/* Top-left: wordmark + reference card */}
@@ -1089,15 +1317,37 @@ export function CanvasHero() {
               aria-label="Mosaic density"
             />
           </div>
+          {isIndexing && (
+            <div className="px-1 font-mono text-[10px] text-muted-foreground">
+              <div className="mb-1 flex justify-between tabular-nums">
+                <span className="tracking-wider uppercase">indexing</span>
+                <span>
+                  {ingestProgress.done}/{ingestProgress.total}
+                </span>
+              </div>
+              <div className="h-1 w-full overflow-hidden rounded-full bg-border">
+                <div
+                  className="h-full rounded-full bg-primary transition-[width] duration-200"
+                  style={{
+                    width: `${(ingestProgress.done / ingestProgress.total) * 100}%`,
+                  }}
+                />
+              </div>
+            </div>
+          )}
           <Button
             size="lg"
             onClick={() => void handleGenerate()}
-            disabled={photos.length === 0 || isGenerating}
+            disabled={readyCount === 0 || isGenerating}
             data-icon="inline-start"
           >
             <Sparkles />
             {isGenerating
-              ? "Generating…"
+              ? generateProgress && generateProgress.total > 0
+                ? `Generating ${Math.round(
+                    (generateProgress.done / generateProgress.total) * 100
+                  )}%`
+                : "Generating…"
               : hasMosaic
                 ? "Regenerate"
                 : "Generate mosaic"}
@@ -1110,6 +1360,7 @@ export function CanvasHero() {
         photos={photos}
         selectedId={selectedPhotoId}
         expanded={isDockExpanded}
+        ingest={ingestProgress}
         onExpandedChange={setIsDockExpanded}
         onAdd={handleAddPhotos}
         onSelect={setSelectedPhotoId}

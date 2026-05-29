@@ -15,9 +15,12 @@ export type WorkerRequest =
       grid: Grid
       ids: string[]
       // Per-cell edge orientation (radians) so the worker can rotate each tile's
-      // photo along the reference's contours. The warped mesh itself is derived
-      // deterministically from the grid on both sides.
+      // photo along the reference's contours.
       angles: Float32Array
+      // Voronoi cell polygons (computed on the main thread): all vertices in
+      // `polys` as x,y pairs, with cell `i` spanning `offsets[i]..offsets[i+1]`.
+      polys: Float32Array
+      offsets: Int32Array
     }
   | { type: "drop"; ids: string[] }
   | { type: "clear" }

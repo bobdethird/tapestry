@@ -20,14 +20,16 @@ import { Slider } from "@/components/ui/slider"
 import { MosaicEngine } from "@/lib/mosaic-client"
 import {
   averageColor,
-  drawWarpedMosaicRegion,
+  drawPolygonMosaicRegion,
+  edgeMagnitudeField,
   gridForCellSize,
   loadImage,
   referenceCellOrientations,
   referenceCellSignatures,
-  warpedGridVertices,
+  type EdgeField,
   type Grid,
 } from "@/lib/mosaic"
+import { voronoiPolygons } from "@/lib/voronoi"
 import { cn } from "@/lib/utils"
 
 const CANVAS_WIDTH = 1600
@@ -38,6 +40,11 @@ const MAX_SCALE = 8
 // Mosaic cell size in px (within the 1600x1000 frame). Smaller = finer grid.
 const DENSITY_MIN = 16
 const DENSITY_MAX = 80
+
+// Resolution of the edge field used to pull Voronoi seeds onto the photo's
+// contours — fine enough to resolve major edges, cheap to compute.
+const EDGE_FIELD_W = 256
+const EDGE_FIELD_H = Math.round((EDGE_FIELD_W * CANVAS_HEIGHT) / CANVAS_WIDTH)
 
 // Once zoomed past this scale we re-render the visible tiles from their
 // full-resolution sources so the constituent photos stay sharp instead of
@@ -53,6 +60,29 @@ type Transform = { x: number; y: number; scale: number }
 
 function clamp(v: number, min: number, max: number) {
   return Math.min(Math.max(v, min), max)
+}
+
+// Paint the edge field as an opaque white-on-black map (brightness by edge
+// strength) into a small canvas — the contour mask the Voronoi seeds relax
+// against, shown on its own when toggled.
+function makeContourMask(edge: EdgeField): HTMLCanvasElement {
+  const { mag, fw, fh } = edge
+  const canvas = document.createElement("canvas")
+  canvas.width = fw
+  canvas.height = fh
+  const ctx = canvas.getContext("2d")
+  if (ctx) {
+    const img = ctx.createImageData(fw, fh)
+    for (let i = 0; i < fw * fh; i++) {
+      const v = Math.round(Math.min(1, mag[i] * 1.6) * 255)
+      img.data[i * 4] = v
+      img.data[i * 4 + 1] = v
+      img.data[i * 4 + 2] = v
+      img.data[i * 4 + 3] = 255
+    }
+    ctx.putImageData(img, 0, 0)
+  }
+  return canvas
 }
 
 function isTypingTarget(t: EventTarget | null) {
@@ -818,6 +848,10 @@ export function CanvasHero() {
   const [isDockExpanded, setIsDockExpanded] = React.useState(false)
   const [reference, setReference] = React.useState<ReferenceImage | null>(null)
   const [density, setDensity] = React.useState(40)
+  const [showContours, setShowContours] = React.useState(false)
+  // Average color of the loaded reference (the grout/background), shown on the
+  // canvas as soon as the reference loads — before any mosaic is generated.
+  const [bgColor, setBgColor] = React.useState<string | null>(null)
   const [isGenerating, setIsGenerating] = React.useState(false)
   const [hasMosaic, setHasMosaic] = React.useState(false)
   // Cumulative ingest progress reported by the worker (done/total photos).
@@ -834,6 +868,15 @@ export function CanvasHero() {
   // High-resolution overlay, pinned to the viewport. When zoomed in we paint the
   // visible tiles into it at device resolution so the photos read sharply.
   const crispCanvasRef = React.useRef<HTMLCanvasElement | null>(null)
+  // Contour-mask overlay (in the transformed frame) + the small mask canvas it
+  // upscales — the edge field the Voronoi seeds relax against, shown on demand.
+  const contourCanvasRef = React.useRef<HTMLCanvasElement | null>(null)
+  const edgeMaskRef = React.useRef<HTMLCanvasElement | null>(null)
+  // Reference-derived data, precomputed when the reference loads and reused at
+  // generate time: the decoded image, its edge field, and its average color.
+  const refImgRef = React.useRef<HTMLImageElement | null>(null)
+  const edgeFieldRef = React.useRef<EdgeField | null>(null)
+  const bgColorRef = React.useRef<string>("#ffffff")
   // What the crisp overlay needs to re-paint the visible mosaic on zoom: the
   // grid, the per-cell tile assignment (indices into thumbUrls), and the tile
   // thumbnail URLs. No full-resolution images are held — that's what lets this
@@ -842,7 +885,8 @@ export function CanvasHero() {
     grid: Grid
     assignment: Int32Array
     angles: Float32Array
-    verts: Float32Array
+    polys: Float32Array
+    offsets: Int32Array
     bg: string
     thumbUrls: string[]
   } | null>(null)
@@ -948,13 +992,26 @@ export function CanvasHero() {
         if (prev) URL.revokeObjectURL(prev.url)
         return next
       })
-      // A new reference invalidates any existing mosaic — back to a white canvas.
+      // A new reference invalidates any existing mosaic.
       setHasMosaic(false)
       mosaicModelRef.current = null
+      edgeMaskRef.current = null
+      edgeFieldRef.current = null
+      refImgRef.current = null
+      setBgColor(null)
       setMosaicVersion((v) => v + 1)
-      mosaicCanvasRef.current
-        ?.getContext("2d")
-        ?.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT)
+      // Precompute the average color (grout/background) and the contour mask from
+      // the reference now, so the canvas shows the color and the contours toggle
+      // work immediately — before the mosaic is generated.
+      const refImg = await loadImage(next.url)
+      if (referenceRef.current !== next) return
+      refImgRef.current = refImg
+      const edge = edgeMagnitudeField(refImg, EDGE_FIELD_W, EDGE_FIELD_H)
+      edgeFieldRef.current = edge
+      edgeMaskRef.current = makeContourMask(edge)
+      bgColorRef.current = averageColor(refImg)
+      setBgColor(bgColorRef.current)
+      setMosaicVersion((v) => v + 1)
     } catch {
       // Unreadable image — keep current state so the user can retry.
     }
@@ -967,6 +1024,10 @@ export function CanvasHero() {
     })
     setHasMosaic(false)
     mosaicModelRef.current = null
+    edgeMaskRef.current = null
+    edgeFieldRef.current = null
+    refImgRef.current = null
+    setBgColor(null)
     setMosaicVersion((v) => v + 1)
   }, [])
 
@@ -983,26 +1044,40 @@ export function CanvasHero() {
     setGenerateProgress(null)
     // Paint the reference's average color (the grout) then the worker frame on
     // top; the frame is transparent between tiles, so the grout shows in the gaps.
-    let bgColor = "#ffffff"
     const blit = (frame: ImageBitmap) => {
       const ctx = mosaicCanvasRef.current?.getContext("2d")
       if (!ctx) return
       ctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT)
-      ctx.fillStyle = bgColor
+      ctx.fillStyle = bgColorRef.current
       ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT)
       ctx.drawImage(frame, 0, 0)
     }
     try {
-      const refImg = await loadImage(ref.url)
-      bgColor = averageColor(refImg)
+      // Reuse the decoded reference + edge field + average color computed when the
+      // reference loaded; fall back to computing them if generate runs first.
+      const refImg = refImgRef.current ?? (await loadImage(ref.url))
+      refImgRef.current = refImg
       const grid = gridForCellSize(density, CANVAS_WIDTH, CANVAS_HEIGHT)
       const cellSigs = referenceCellSignatures(refImg, grid)
       // Per-cell edge orientation so each tile is rotated to follow the
       // reference's contours.
       const angles = referenceCellOrientations(refImg, grid)
-      // Warped mesh: irregular quads that tessellate (no white gaps). Computed
-      // deterministically here for the zoom overlay; the worker mirrors it.
-      const verts = warpedGridVertices(grid, CANVAS_WIDTH, CANVAS_HEIGHT)
+      // Voronoi tessellation: varied polygons (triangles … hexagons) that tile
+      // with no gaps. Seeds are relaxed against the reference's edge field so the
+      // cell borders follow its contours. Computed here and passed to the worker
+      // so both render the identical layout.
+      const edge =
+        edgeFieldRef.current ??
+        edgeMagnitudeField(refImg, EDGE_FIELD_W, EDGE_FIELD_H)
+      edgeFieldRef.current = edge
+      edgeMaskRef.current = makeContourMask(edge)
+      bgColorRef.current = averageColor(refImg)
+      const { polys, offsets } = voronoiPolygons(
+        grid,
+        CANVAS_WIDTH,
+        CANVAS_HEIGHT,
+        edge
+      )
       const ids = ready.map((p) => p.id)
       const thumbUrls = ready.map((p) => p.thumbUrl as string)
       // The worker matches tiles to cells and renders the base mosaic, streaming
@@ -1013,6 +1088,8 @@ export function CanvasHero() {
         grid,
         ids,
         angles,
+        polys,
+        offsets,
         (frame, doneCells, totalCells) => {
           // Ignore frames from a superseded generate.
           if (token !== generateTokenRef.current) {
@@ -1033,7 +1110,15 @@ export function CanvasHero() {
       base.close()
       // Keep the render model so the crisp overlay can repaint visible tiles
       // from their thumbnails as the user zooms in.
-      mosaicModelRef.current = { grid, assignment, angles, verts, bg: bgColor, thumbUrls }
+      mosaicModelRef.current = {
+        grid,
+        assignment,
+        angles,
+        polys,
+        offsets,
+        bg: bgColorRef.current,
+        thumbUrls,
+      }
       setMosaicVersion((v) => v + 1)
       setHasMosaic(true)
     } catch {
@@ -1103,7 +1188,7 @@ export function CanvasHero() {
       const cssH = canvas.clientHeight
       if (!cssW || !cssH) return
 
-      const { grid, assignment, angles, verts, bg, thumbUrls } = model
+      const { grid, assignment, angles, polys, offsets, bg, thumbUrls } = model
       const region = {
         x: -t.x / t.scale,
         y: -t.y / t.scale,
@@ -1112,12 +1197,12 @@ export function CanvasHero() {
       }
       const cw = CANVAS_WIDTH / grid.cols
       const ch = CANVAS_HEIGHT / grid.rows
-      // Widen by one cell to match drawWarpedMosaicRegion, so warped quads that
-      // spill in from just outside the region still get their tiles decoded.
-      const colStart = Math.max(0, Math.floor(region.x / cw) - 1)
-      const colEnd = Math.min(grid.cols - 1, Math.floor((region.x + region.w) / cw) + 1)
-      const rowStart = Math.max(0, Math.floor(region.y / ch) - 1)
-      const rowEnd = Math.min(grid.rows - 1, Math.floor((region.y + region.h) / ch) + 1)
+      // Widen by two cells to match drawPolygonMosaicRegion, so Voronoi cells
+      // that spill in from just outside the region still get their tiles decoded.
+      const colStart = Math.max(0, Math.floor(region.x / cw) - 2)
+      const colEnd = Math.min(grid.cols - 1, Math.floor((region.x + region.w) / cw) + 2)
+      const rowStart = Math.max(0, Math.floor(region.y / ch) - 2)
+      const rowEnd = Math.min(grid.rows - 1, Math.floor((region.y + region.h) / ch) + 2)
       if (colEnd < colStart || rowEnd < rowStart) return
 
       // Decode only the tiles visible in this region.
@@ -1161,7 +1246,7 @@ export function CanvasHero() {
         ctx.fillStyle = bg
         ctx.fillRect(fx, fy, fw, fh)
       }
-      drawWarpedMosaicRegion(
+      drawPolygonMosaicRegion(
         ctx,
         grid,
         assignment,
@@ -1170,7 +1255,8 @@ export function CanvasHero() {
         CANVAS_WIDTH,
         CANVAS_HEIGHT,
         region,
-        verts
+        polys,
+        offsets
       )
     },
     [ensureThumb]
@@ -1185,7 +1271,14 @@ export function CanvasHero() {
     if (!canvas) return
     canvas.style.transition = "none"
     canvas.style.opacity = "0"
-    if (!mosaicModelRef.current || transform.scale < CRISP_SCALE || animating)
+    // While the contour mask is shown, keep the sharp overlay hidden so the mask
+    // is displayed on its own (it sits above this overlay in the DOM).
+    if (
+      !mosaicModelRef.current ||
+      transform.scale < CRISP_SCALE ||
+      animating ||
+      showContours
+    )
       return
     let cancelled = false
     const id = window.setTimeout(() => {
@@ -1199,7 +1292,7 @@ export function CanvasHero() {
       cancelled = true
       window.clearTimeout(id)
     }
-  }, [transform, mosaicVersion, animating, renderCrisp])
+  }, [transform, mosaicVersion, animating, renderCrisp, showContours])
 
   // Paste an image from the clipboard to set or replace the reference.
   React.useEffect(() => {
@@ -1221,6 +1314,34 @@ export function CanvasHero() {
     window.addEventListener("paste", onPaste)
     return () => window.removeEventListener("paste", onPaste)
   }, [handleSetReference])
+
+  // Show the contour mask on its own when toggled on: the opaque white-on-black
+  // edge field the Voronoi seeds relax against (it covers the mosaic below).
+  React.useEffect(() => {
+    const canvas = contourCanvasRef.current
+    const ctx = canvas?.getContext("2d")
+    if (!canvas || !ctx) return
+    ctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT)
+    const mask = edgeMaskRef.current
+    if (showContours && mask) {
+      ctx.imageSmoothingEnabled = true
+      ctx.imageSmoothingQuality = "high"
+      ctx.drawImage(mask, 0, 0, CANVAS_WIDTH, CANVAS_HEIGHT)
+    }
+  }, [showContours, mosaicVersion])
+
+  // Before a mosaic is generated, show the loaded reference's average color on
+  // the base canvas (and clear it again once the reference is removed).
+  React.useEffect(() => {
+    if (hasMosaic) return
+    const ctx = mosaicCanvasRef.current?.getContext("2d")
+    if (!ctx) return
+    ctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT)
+    if (reference && bgColor) {
+      ctx.fillStyle = bgColor
+      ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT)
+    }
+  }, [reference, bgColor, hasMosaic])
 
   const readyCount = photos.reduce(
     (n, p) => (p.status === "ready" && p.thumbUrl ? n + 1 : n),
@@ -1276,12 +1397,22 @@ export function CanvasHero() {
           )}
         >
           {reference ? (
-            <canvas
-              ref={mosaicCanvasRef}
-              width={CANVAS_WIDTH}
-              height={CANVAS_HEIGHT}
-              className="block size-full bg-white"
-            />
+            <>
+              <canvas
+                ref={mosaicCanvasRef}
+                width={CANVAS_WIDTH}
+                height={CANVAS_HEIGHT}
+                className="block size-full bg-white"
+              />
+              <canvas
+                ref={contourCanvasRef}
+                width={CANVAS_WIDTH}
+                height={CANVAS_HEIGHT}
+                aria-hidden
+                className="pointer-events-none absolute inset-0 block size-full transition-opacity duration-200"
+                style={{ opacity: showContours ? 1 : 0 }}
+              />
+            </>
           ) : (
             <CanvasArtwork />
           )}
@@ -1348,6 +1479,20 @@ export function CanvasHero() {
               aria-label="Mosaic density"
             />
           </div>
+          <button
+            type="button"
+            onClick={() => setShowContours((v) => !v)}
+            aria-pressed={showContours}
+            className="flex items-center gap-2 px-1 font-mono text-[10px] tracking-wider text-muted-foreground uppercase transition-colors hover:text-foreground"
+          >
+            <span
+              className={cn(
+                "inline-block size-2 rounded-full transition-colors",
+                showContours ? "bg-primary" : "bg-border"
+              )}
+            />
+            contours
+          </button>
           {isIndexing && (
             <div className="px-1 font-mono text-[10px] text-muted-foreground">
               <div className="mb-1 flex justify-between tabular-nums">

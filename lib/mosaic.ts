@@ -198,6 +198,52 @@ export function averageColor(img: TileSource): string {
   return `rgb(${data[0]}, ${data[1]}, ${data[2]})`
 }
 
+// A normalized (0..1) Sobel edge-magnitude field of the reference at fw×fh. The
+// Voronoi seeder uses it to push seeds out of edges so the cell borders settle
+// along the photo's contours.
+export type EdgeField = { mag: Float32Array; fw: number; fh: number }
+
+export function edgeMagnitudeField(
+  ref: TileSource,
+  fw: number,
+  fh: number
+): EdgeField {
+  const ctx = createContext2d(fw, fh)
+  drawCover(ctx, ref, 0, 0, fw, fh)
+  const { data } = ctx.getImageData(0, 0, fw, fh)
+  const lum = new Float32Array(fw * fh)
+  for (let i = 0; i < fw * fh; i++) {
+    lum[i] =
+      0.299 * data[i * 4] + 0.587 * data[i * 4 + 1] + 0.114 * data[i * 4 + 2]
+  }
+  const at = (x: number, y: number) => {
+    const cx = x < 0 ? 0 : x >= fw ? fw - 1 : x
+    const cy = y < 0 ? 0 : y >= fh ? fh - 1 : y
+    return lum[cy * fw + cx]
+  }
+  const mag = new Float32Array(fw * fh)
+  let max = 1e-6
+  for (let y = 0; y < fh; y++) {
+    for (let x = 0; x < fw; x++) {
+      const gx =
+        at(x + 1, y - 1) +
+        2 * at(x + 1, y) +
+        at(x + 1, y + 1) -
+        (at(x - 1, y - 1) + 2 * at(x - 1, y) + at(x - 1, y + 1))
+      const gy =
+        at(x - 1, y + 1) +
+        2 * at(x, y + 1) +
+        at(x + 1, y + 1) -
+        (at(x - 1, y - 1) + 2 * at(x, y - 1) + at(x + 1, y - 1))
+      const m = Math.hypot(gx, gy)
+      mag[y * fw + x] = m
+      if (m > max) max = m
+    }
+  }
+  for (let i = 0; i < mag.length; i++) mag[i] /= max
+  return { mag, fw, fh }
+}
+
 export function mse(a: Float32Array, b: Float32Array): number {
   let sum = 0
   for (let i = 0; i < a.length; i++) {
@@ -290,123 +336,76 @@ export function drawMosaicRegion(
   }
 }
 
-// Fast, deterministic PRNG (mulberry32) so the warped mesh is stable across
-// re-renders rather than jittering on every generate.
-function mulberry32(seed: number): () => number {
-  let a = seed >>> 0
-  return () => {
-    a = (a + 0x6d2b79f5) | 0
-    let t = Math.imul(a ^ (a >>> 15), 1 | a)
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
-  }
-}
-
-// Seed + how far interior mesh vertices wander (fraction of a cell). Kept well
-// below 0.5 so neighbouring vertices never cross and the quads stay simple.
-const MESH_SEED = 0x9e3779b9
-const MESH_JITTER = 0.34
-
-// Vertices of a (cols+1)×(rows+1) mesh over the width×height frame with interior
-// points jittered; border points stay on the frame edge. Adjacent cells share
-// corners, so the resulting quads tile the frame with no gaps. A vertex (vx,vy)
-// lives at index (vy*(cols+1)+vx)*2. Deterministic, so the worker (base render)
-// and the main thread (zoom overlay) compute identical meshes.
-export function warpedGridVertices(
-  grid: Grid,
-  width: number,
-  height: number
-): Float32Array {
-  const { cols, rows } = grid
-  const vcols = cols + 1
-  const vrows = rows + 1
-  const cw = width / cols
-  const ch = height / rows
-  const pts = new Float32Array(vcols * vrows * 2)
-  for (let vy = 0; vy < vrows; vy++) {
-    for (let vx = 0; vx < vcols; vx++) {
-      const rng = mulberry32(
-        (MESH_SEED ^ Math.imul(vx, 73856093) ^ Math.imul(vy, 19349663)) >>> 0
-      )
-      const jx = (rng() * 2 - 1) * MESH_JITTER * cw
-      const jy = (rng() * 2 - 1) * MESH_JITTER * ch
-      const i = (vy * vcols + vx) * 2
-      pts[i] = vx * cw + (vx > 0 && vx < cols ? jx : 0)
-      pts[i + 1] = vy * ch + (vy > 0 && vy < rows ? jy : 0)
-    }
-  }
-  return pts
-}
-
-// Gap between tiles (fraction each quad shrinks toward its center) and the soft
-// drop shadow that makes every tile read as a raised mosaic piece.
+// Gap between tiles (fraction each shrinks toward its center) and the soft drop
+// shadow that makes every tile read as a raised mosaic piece.
 const TILE_GAP = 0.08
 const TILE_SHADOW_COLOR = "rgba(0, 0, 0, 0.32)"
 const TILE_SHADOW_BLUR = 0.12 // × tile size
 const TILE_SHADOW_OFFSET = 0.05 // × tile size
 
-// Fill one cell's warped quad with its photo: shrink the quad slightly (a grout
-// gap), cast a soft offset shadow so the tile looks raised, then clip to the
-// inset quad and cover-fill with the image rotated to the cell's edge angle. The
-// cover square spans the quad's diagonal so it still covers it after rotation.
-export function drawWarpedCell(
+// Fill one Voronoi cell with its photo. Polygons are packed flat: cell `i` owns
+// the vertices `offsets[i]..offsets[i+1]` in `polys` (as x,y pairs). We shrink
+// the polygon toward its centroid (a grout gap), cast a soft offset shadow so
+// the tile looks raised, then clip to it and cover-fill with the rotated photo.
+// The cover square spans the polygon so it still covers it after rotation.
+export function drawPolygonCell(
   ctx: AnyCanvasContext,
-  col: number,
-  row: number,
-  cols: number,
-  verts: ArrayLike<number>,
+  polys: ArrayLike<number>,
+  offsets: ArrayLike<number>,
+  i: number,
   img: TileSource,
   angle: number
 ) {
-  const vcols = cols + 1
-  const tl = (row * vcols + col) * 2
-  const tr = (row * vcols + col + 1) * 2
-  const br = ((row + 1) * vcols + col + 1) * 2
-  const bl = ((row + 1) * vcols + col) * 2
-  const minX = Math.min(verts[tl], verts[tr], verts[br], verts[bl])
-  const maxX = Math.max(verts[tl], verts[tr], verts[br], verts[bl])
-  const minY = Math.min(verts[tl + 1], verts[tr + 1], verts[br + 1], verts[bl + 1])
-  const maxY = Math.max(verts[tl + 1], verts[tr + 1], verts[br + 1], verts[bl + 1])
-  const mx = (minX + maxX) / 2
-  const my = (minY + maxY) / 2
-  // Shrink each corner toward the center to leave a grout gap between neighbours.
+  const start = offsets[i]
+  const end = offsets[i + 1]
+  const n = end - start
+  if (n < 3) return
+  let sx = 0
+  let sy = 0
+  for (let v = start; v < end; v++) {
+    sx += polys[v * 2]
+    sy += polys[v * 2 + 1]
+  }
+  const mx = sx / n
+  const my = sy / n
+  // Inset each vertex toward the centroid for the grout gap, tracking the
+  // farthest one so the cover square (its diameter) still covers it when rotated.
   const k = 1 - TILE_GAP
-  const x0 = mx + (verts[tl] - mx) * k
-  const y0 = my + (verts[tl + 1] - my) * k
-  const x1 = mx + (verts[tr] - mx) * k
-  const y1 = my + (verts[tr + 1] - my) * k
-  const x2 = mx + (verts[br] - mx) * k
-  const y2 = my + (verts[br + 1] - my) * k
-  const x3 = mx + (verts[bl] - mx) * k
-  const y3 = my + (verts[bl + 1] - my) * k
-  const cover = Math.hypot(maxX - minX, maxY - minY) * k
+  const ix: number[] = new Array(n)
+  const iy: number[] = new Array(n)
+  let maxDist = 0
+  for (let j = 0; j < n; j++) {
+    const px = mx + (polys[(start + j) * 2] - mx) * k
+    const py = my + (polys[(start + j) * 2 + 1] - my) * k
+    ix[j] = px
+    iy[j] = py
+    const d = Math.hypot(px - mx, py - my)
+    if (d > maxDist) maxDist = d
+  }
+  const cover = maxDist * 2
   const c = ctx as CanvasRenderingContext2D
+  const trace = () => {
+    c.beginPath()
+    c.moveTo(ix[0], iy[0])
+    for (let j = 1; j < n; j++) c.lineTo(ix[j], iy[j])
+    c.closePath()
+  }
 
-  // Shadow pass: a filled quad with a soft offset shadow. The fill is hidden by
-  // the image below; only the shadow spilling into the gap stays visible.
+  // Shadow pass: a filled polygon with a soft offset shadow. The fill is hidden
+  // by the image below; only the shadow spilling into the gap stays visible.
   c.save()
   c.shadowColor = TILE_SHADOW_COLOR
   c.shadowBlur = cover * TILE_SHADOW_BLUR
   c.shadowOffsetX = cover * TILE_SHADOW_OFFSET
   c.shadowOffsetY = cover * TILE_SHADOW_OFFSET
-  c.beginPath()
-  c.moveTo(x0, y0)
-  c.lineTo(x1, y1)
-  c.lineTo(x2, y2)
-  c.lineTo(x3, y3)
-  c.closePath()
+  trace()
   c.fillStyle = "#000"
   c.fill()
   c.restore()
 
-  // Image pass: clip to the inset quad and cover-fill with the rotated photo.
+  // Image pass: clip to the inset polygon and cover-fill with the rotated photo.
   c.save()
-  c.beginPath()
-  c.moveTo(x0, y0)
-  c.lineTo(x1, y1)
-  c.lineTo(x2, y2)
-  c.lineTo(x3, y3)
-  c.closePath()
+  trace()
   c.clip()
   c.translate(mx, my)
   if (angle) c.rotate(angle)
@@ -414,11 +413,11 @@ export function drawWarpedCell(
   c.restore()
 }
 
-// Warped-mesh variant of `drawMosaicRegion`: every cell is an irregular quad (so
-// tiles are non-rectangular and tessellate with no white space), filled with its
-// matched photo rotated to the cell's edge orientation. The visited range is
-// widened by one cell so jitter-spilled quads aren't clipped at the region edge.
-export function drawWarpedMosaicRegion(
+// Voronoi variant of `drawMosaicRegion`: every cell is a polygon (triangle …
+// hexagon) that tessellates, filled with its matched photo rotated to the cell's
+// edge orientation. Cells are seeded from the grid, so we cull by grid cell
+// (widened generously, since a Voronoi cell can spill past its seed's cell).
+export function drawPolygonMosaicRegion(
   ctx: AnyCanvasContext,
   grid: Grid,
   assignment: ArrayLike<number>,
@@ -427,22 +426,23 @@ export function drawWarpedMosaicRegion(
   width: number,
   height: number,
   region: Region,
-  verts: ArrayLike<number>
+  polys: ArrayLike<number>,
+  offsets: ArrayLike<number>
 ) {
   const { cols, rows } = grid
   const cw = width / cols
   const ch = height / rows
-  const colStart = Math.max(0, Math.floor(region.x / cw) - 1)
-  const colEnd = Math.min(cols - 1, Math.floor((region.x + region.w) / cw) + 1)
-  const rowStart = Math.max(0, Math.floor(region.y / ch) - 1)
-  const rowEnd = Math.min(rows - 1, Math.floor((region.y + region.h) / ch) + 1)
+  const colStart = Math.max(0, Math.floor(region.x / cw) - 2)
+  const colEnd = Math.min(cols - 1, Math.floor((region.x + region.w) / cw) + 2)
+  const rowStart = Math.max(0, Math.floor(region.y / ch) - 2)
+  const rowEnd = Math.min(rows - 1, Math.floor((region.y + region.h) / ch) + 2)
   if (colEnd < colStart || rowEnd < rowStart) return
   for (let row = rowStart; row <= rowEnd; row++) {
     for (let col = colStart; col <= colEnd; col++) {
       const idx = row * cols + col
       const tile = tiles[assignment[idx]]
       if (!tile) continue
-      drawWarpedCell(ctx, col, row, cols, verts, tile, angles[idx])
+      drawPolygonCell(ctx, polys, offsets, idx, tile, angles[idx])
     }
   }
 }

@@ -10,12 +10,7 @@
 
 import exifr from "exifr"
 
-import {
-  drawWarpedCell,
-  signatureOf,
-  warpedGridVertices,
-  type Grid,
-} from "./mosaic"
+import { drawPolygonCell, signatureOf, type Grid } from "./mosaic"
 import type { IngestItem, WorkerRequest, WorkerResponse } from "./mosaic-protocol"
 
 // Minimal view of the worker global so we don't need the conflicting
@@ -144,7 +139,9 @@ async function handleGenerate(
   cellSigs: Float32Array[],
   grid: Grid,
   ids: string[],
-  angles: Float32Array
+  angles: Float32Array,
+  polys: Float32Array,
+  offsets: Int32Array
 ): Promise<void> {
   activeGenerate = reqId
 
@@ -166,9 +163,6 @@ async function handleGenerate(
 
   const { cols, rows } = grid
   const cellCount = cols * rows
-  // Warped mesh shared (deterministically) with the main thread: each cell is an
-  // irregular quad, and adjacent quads share corners so they tile with no gaps.
-  const verts = warpedGridVertices(grid, CANVAS_WIDTH, CANVAS_HEIGHT)
   const assignment = new Int32Array(cellCount)
   const decoded = new Map<number, ImageBitmap>()
   const cleanup = () => {
@@ -208,9 +202,7 @@ async function handleGenerate(
 
     const bmp = await decodeTile(best, ids, decoded)
     if (bmp) {
-      const col = cell % cols
-      const row = (cell - col) / cols
-      drawWarpedCell(ctx, col, row, cols, verts, bmp, angles[cell])
+      drawPolygonCell(ctx, polys, offsets, cell, bmp, angles[cell])
     }
 
     const now = performance.now()
@@ -249,7 +241,15 @@ scope.onmessage = (e: MessageEvent<WorkerRequest>) => {
       void runIngest()
       break
     case "generate":
-      void handleGenerate(msg.reqId, msg.cellSigs, msg.grid, msg.ids, msg.angles)
+      void handleGenerate(
+        msg.reqId,
+        msg.cellSigs,
+        msg.grid,
+        msg.ids,
+        msg.angles,
+        msg.polys,
+        msg.offsets
+      )
       break
     case "drop":
       for (const id of msg.ids) store.delete(id)

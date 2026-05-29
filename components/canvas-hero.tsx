@@ -17,12 +17,25 @@ import {
 } from "@/components/reference-image"
 import { Button } from "@/components/ui/button"
 import { Separator } from "@/components/ui/separator"
+import { Slider } from "@/components/ui/slider"
+import {
+  assignTiles,
+  drawMosaic,
+  gridForCellSize,
+  loadImage,
+  referenceCellSignatures,
+  signatureOf,
+} from "@/lib/mosaic"
 import { cn } from "@/lib/utils"
 
 const CANVAS_WIDTH = 1600
 const CANVAS_HEIGHT = 1000
 const MIN_SCALE = 0.1
 const MAX_SCALE = 8
+
+// Mosaic cell size in px (within the 1600x1000 frame). Smaller = finer grid.
+const DENSITY_MIN = 16
+const DENSITY_MAX = 80
 
 type Transform = { x: number; y: number; scale: number }
 
@@ -792,6 +805,15 @@ export function CanvasHero() {
   )
   const [isDockExpanded, setIsDockExpanded] = React.useState(false)
   const [reference, setReference] = React.useState<ReferenceImage | null>(null)
+  const [density, setDensity] = React.useState(40)
+  const [isGenerating, setIsGenerating] = React.useState(false)
+  const [hasMosaic, setHasMosaic] = React.useState(false)
+  const mosaicCanvasRef = React.useRef<HTMLCanvasElement | null>(null)
+  // Cache each tile's decoded image + signature by photo id. The signature size
+  // is fixed, so it survives density changes; only new photos need decoding.
+  const tileCacheRef = React.useRef<
+    Map<string, { img: HTMLImageElement; sig: Float32Array }>
+  >(new Map())
 
   // Blob URLs are session-scoped — revoke them when the component unmounts so
   // we don't leak memory or hold onto detached files.
@@ -861,6 +883,11 @@ export function CanvasHero() {
         if (prev) URL.revokeObjectURL(prev.url)
         return next
       })
+      // A new reference invalidates any existing mosaic — back to a white canvas.
+      setHasMosaic(false)
+      mosaicCanvasRef.current
+        ?.getContext("2d")
+        ?.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT)
     } catch {
       // Unreadable image — keep current state so the user can retry.
     }
@@ -871,12 +898,68 @@ export function CanvasHero() {
       if (prev) URL.revokeObjectURL(prev.url)
       return null
     })
+    setHasMosaic(false)
   }, [])
 
-  const handleGenerate = React.useCallback(() => {
-    // TODO: mosaic generation (future phase) — assemble `photos` into a mosaic
-    // that matches `reference`, then swap it in for the placeholder artwork.
-  }, [])
+  const handleGenerate = React.useCallback(async () => {
+    const ref = referenceRef.current
+    if (!ref || photos.length === 0) return
+    setIsGenerating(true)
+    try {
+      const refImg = await loadImage(ref.url)
+      // Decode + sign each tile once; cache by id so density tweaks stay cheap.
+      const tiles = await Promise.all(
+        photos.map(async (p) => {
+          const cached = tileCacheRef.current.get(p.id)
+          if (cached) return cached
+          const img = await loadImage(p.url)
+          const entry = { img, sig: signatureOf(img) }
+          tileCacheRef.current.set(p.id, entry)
+          return entry
+        })
+      )
+      const grid = gridForCellSize(density, CANVAS_WIDTH, CANVAS_HEIGHT)
+      const cellSigs = referenceCellSignatures(refImg, grid)
+      const assignment = assignTiles(
+        cellSigs,
+        tiles.map((t) => t.sig)
+      )
+      const ctx = mosaicCanvasRef.current?.getContext("2d")
+      if (ctx) {
+        ctx.fillStyle = "#ffffff"
+        ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT)
+        drawMosaic(
+          ctx,
+          grid,
+          assignment,
+          tiles.map((t) => t.img),
+          CANVAS_WIDTH,
+          CANVAS_HEIGHT
+        )
+      }
+      setHasMosaic(true)
+    } catch {
+      // Generation failed (e.g. a tile couldn't decode) — keep the prior canvas.
+    } finally {
+      setIsGenerating(false)
+    }
+  }, [photos, density])
+
+  // Keep the latest generator in a ref so the live-density effect can call it
+  // without resubscribing on every render.
+  const generateRef = React.useRef(handleGenerate)
+  React.useEffect(() => {
+    generateRef.current = handleGenerate
+  }, [handleGenerate])
+
+  // Once a mosaic exists, re-run (debounced) whenever density changes so the
+  // slider tunes the result live.
+  React.useEffect(() => {
+    if (!hasMosaic) return
+    const id = window.setTimeout(() => void generateRef.current(), 150)
+    return () => window.clearTimeout(id)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [density])
 
   // Paste an image from the clipboard to set or replace the reference.
   React.useEffect(() => {
@@ -946,7 +1029,12 @@ export function CanvasHero() {
           )}
         >
           {reference ? (
-            <div className="size-full bg-white" />
+            <canvas
+              ref={mosaicCanvasRef}
+              width={CANVAS_WIDTH}
+              height={CANVAS_HEIGHT}
+              className="block size-full bg-white"
+            />
           ) : (
             <CanvasArtwork />
           )}
@@ -981,18 +1069,38 @@ export function CanvasHero() {
         on100={reset100}
       />
 
-      {/* Generate the mosaic from the tiles (enabled once tiles exist) */}
+      {/* Mosaic controls: density + generate (enabled once tiles exist) */}
       {reference && (
-        <div data-no-pan className="absolute right-6 bottom-14 z-20">
+        <div
+          data-no-pan
+          className="absolute right-6 bottom-14 z-20 flex flex-col gap-2 rounded-2xl border border-border/60 bg-popover/85 p-2.5 shadow-xl shadow-black/15 backdrop-blur-md"
+        >
+          <div className="flex items-center gap-3 px-1">
+            <span className="font-mono text-[10px] tracking-wider text-muted-foreground uppercase">
+              density
+            </span>
+            <Slider
+              className="w-36"
+              min={DENSITY_MIN}
+              max={DENSITY_MAX}
+              step={2}
+              value={[DENSITY_MIN + DENSITY_MAX - density]}
+              onValueChange={(v) => setDensity(DENSITY_MIN + DENSITY_MAX - v[0])}
+              aria-label="Mosaic density"
+            />
+          </div>
           <Button
             size="lg"
-            onClick={handleGenerate}
-            disabled={photos.length === 0}
+            onClick={() => void handleGenerate()}
+            disabled={photos.length === 0 || isGenerating}
             data-icon="inline-start"
-            className="shadow-xl shadow-black/15"
           >
             <Sparkles />
-            Generate mosaic
+            {isGenerating
+              ? "Generating…"
+              : hasMosaic
+                ? "Regenerate"
+                : "Generate mosaic"}
           </Button>
         </div>
       )}

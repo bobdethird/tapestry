@@ -19,6 +19,7 @@ import { Separator } from "@/components/ui/separator"
 import { Slider } from "@/components/ui/slider"
 import { MosaicEngine } from "@/lib/mosaic-client"
 import {
+  averageColor,
   drawWarpedMosaicRegion,
   gridForCellSize,
   loadImage,
@@ -842,6 +843,7 @@ export function CanvasHero() {
     assignment: Int32Array
     angles: Float32Array
     verts: Float32Array
+    bg: string
     thumbUrls: string[]
   } | null>(null)
   // Bumped whenever the mosaic is (re)generated or cleared, so the crisp-overlay
@@ -979,16 +981,20 @@ export function CanvasHero() {
     const token = ++generateTokenRef.current
     setIsGenerating(true)
     setGenerateProgress(null)
-    // Paint a worker-rendered frame (final or in-progress) onto the canvas.
+    // Paint the reference's average color (the grout) then the worker frame on
+    // top; the frame is transparent between tiles, so the grout shows in the gaps.
+    let bgColor = "#ffffff"
     const blit = (frame: ImageBitmap) => {
       const ctx = mosaicCanvasRef.current?.getContext("2d")
-      if (ctx) {
-        ctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT)
-        ctx.drawImage(frame, 0, 0)
-      }
+      if (!ctx) return
+      ctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT)
+      ctx.fillStyle = bgColor
+      ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT)
+      ctx.drawImage(frame, 0, 0)
     }
     try {
       const refImg = await loadImage(ref.url)
+      bgColor = averageColor(refImg)
       const grid = gridForCellSize(density, CANVAS_WIDTH, CANVAS_HEIGHT)
       const cellSigs = referenceCellSignatures(refImg, grid)
       // Per-cell edge orientation so each tile is rotated to follow the
@@ -1027,7 +1033,7 @@ export function CanvasHero() {
       base.close()
       // Keep the render model so the crisp overlay can repaint visible tiles
       // from their thumbnails as the user zooms in.
-      mosaicModelRef.current = { grid, assignment, angles, verts, thumbUrls }
+      mosaicModelRef.current = { grid, assignment, angles, verts, bg: bgColor, thumbUrls }
       setMosaicVersion((v) => v + 1)
       setHasMosaic(true)
     } catch {
@@ -1097,7 +1103,7 @@ export function CanvasHero() {
       const cssH = canvas.clientHeight
       if (!cssW || !cssH) return
 
-      const { grid, assignment, angles, verts, thumbUrls } = model
+      const { grid, assignment, angles, verts, bg, thumbUrls } = model
       const region = {
         x: -t.x / t.scale,
         y: -t.y / t.scale,
@@ -1145,6 +1151,16 @@ export function CanvasHero() {
       ctx.setTransform(dpr * t.scale, 0, 0, dpr * t.scale, dpr * t.x, dpr * t.y)
       ctx.imageSmoothingEnabled = true
       ctx.imageSmoothingQuality = "high"
+      // Grout: fill the reference's average color behind the tiles (clamped to
+      // the artwork frame) so gaps stay on-palette and crisp when zoomed in.
+      const fx = Math.max(region.x, 0)
+      const fy = Math.max(region.y, 0)
+      const fw = Math.min(region.x + region.w, CANVAS_WIDTH) - fx
+      const fh = Math.min(region.y + region.h, CANVAS_HEIGHT) - fy
+      if (fw > 0 && fh > 0) {
+        ctx.fillStyle = bg
+        ctx.fillRect(fx, fy, fw, fh)
+      }
       drawWarpedMosaicRegion(
         ctx,
         grid,

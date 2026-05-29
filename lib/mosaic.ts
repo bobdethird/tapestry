@@ -188,6 +188,16 @@ export function referenceCellOrientations(
   return angles
 }
 
+// Average color of the reference (its mean pixel), used as the mosaic's grout /
+// background so the gaps between tiles sit on-palette. Squishing the whole image
+// into a single pixel lets the browser area-average every pixel for us.
+export function averageColor(img: TileSource): string {
+  const ctx = createContext2d(1, 1)
+  ;(ctx as CanvasRenderingContext2D).drawImage(img, 0, 0, 1, 1)
+  const { data } = ctx.getImageData(0, 0, 1, 1)
+  return `rgb(${data[0]}, ${data[1]}, ${data[2]})`
+}
+
 export function mse(a: Float32Array, b: Float32Array): number {
   let sum = 0
   for (let i = 0; i < a.length; i++) {
@@ -328,9 +338,17 @@ export function warpedGridVertices(
   return pts
 }
 
-// Fill one cell's warped quad with its photo: clip to the quad, then cover-fill
-// with the image rotated to the cell's edge angle. The cover square is sized to
-// the quad's diagonal so it still covers the quad after rotation — no white.
+// Gap between tiles (fraction each quad shrinks toward its center) and the soft
+// drop shadow that makes every tile read as a raised mosaic piece.
+const TILE_GAP = 0.08
+const TILE_SHADOW_COLOR = "rgba(0, 0, 0, 0.32)"
+const TILE_SHADOW_BLUR = 0.12 // × tile size
+const TILE_SHADOW_OFFSET = 0.05 // × tile size
+
+// Fill one cell's warped quad with its photo: shrink the quad slightly (a grout
+// gap), cast a soft offset shadow so the tile looks raised, then clip to the
+// inset quad and cover-fill with the image rotated to the cell's edge angle. The
+// cover square spans the quad's diagonal so it still covers it after rotation.
 export function drawWarpedCell(
   ctx: AnyCanvasContext,
   col: number,
@@ -345,20 +363,43 @@ export function drawWarpedCell(
   const tr = (row * vcols + col + 1) * 2
   const br = ((row + 1) * vcols + col + 1) * 2
   const bl = ((row + 1) * vcols + col) * 2
-  const x0 = verts[tl]
-  const y0 = verts[tl + 1]
-  const x1 = verts[tr]
-  const y1 = verts[tr + 1]
-  const x2 = verts[br]
-  const y2 = verts[br + 1]
-  const x3 = verts[bl]
-  const y3 = verts[bl + 1]
-  const minX = Math.min(x0, x1, x2, x3)
-  const maxX = Math.max(x0, x1, x2, x3)
-  const minY = Math.min(y0, y1, y2, y3)
-  const maxY = Math.max(y0, y1, y2, y3)
-  const side = Math.hypot(maxX - minX, maxY - minY)
+  const minX = Math.min(verts[tl], verts[tr], verts[br], verts[bl])
+  const maxX = Math.max(verts[tl], verts[tr], verts[br], verts[bl])
+  const minY = Math.min(verts[tl + 1], verts[tr + 1], verts[br + 1], verts[bl + 1])
+  const maxY = Math.max(verts[tl + 1], verts[tr + 1], verts[br + 1], verts[bl + 1])
+  const mx = (minX + maxX) / 2
+  const my = (minY + maxY) / 2
+  // Shrink each corner toward the center to leave a grout gap between neighbours.
+  const k = 1 - TILE_GAP
+  const x0 = mx + (verts[tl] - mx) * k
+  const y0 = my + (verts[tl + 1] - my) * k
+  const x1 = mx + (verts[tr] - mx) * k
+  const y1 = my + (verts[tr + 1] - my) * k
+  const x2 = mx + (verts[br] - mx) * k
+  const y2 = my + (verts[br + 1] - my) * k
+  const x3 = mx + (verts[bl] - mx) * k
+  const y3 = my + (verts[bl + 1] - my) * k
+  const cover = Math.hypot(maxX - minX, maxY - minY) * k
   const c = ctx as CanvasRenderingContext2D
+
+  // Shadow pass: a filled quad with a soft offset shadow. The fill is hidden by
+  // the image below; only the shadow spilling into the gap stays visible.
+  c.save()
+  c.shadowColor = TILE_SHADOW_COLOR
+  c.shadowBlur = cover * TILE_SHADOW_BLUR
+  c.shadowOffsetX = cover * TILE_SHADOW_OFFSET
+  c.shadowOffsetY = cover * TILE_SHADOW_OFFSET
+  c.beginPath()
+  c.moveTo(x0, y0)
+  c.lineTo(x1, y1)
+  c.lineTo(x2, y2)
+  c.lineTo(x3, y3)
+  c.closePath()
+  c.fillStyle = "#000"
+  c.fill()
+  c.restore()
+
+  // Image pass: clip to the inset quad and cover-fill with the rotated photo.
   c.save()
   c.beginPath()
   c.moveTo(x0, y0)
@@ -367,9 +408,9 @@ export function drawWarpedCell(
   c.lineTo(x3, y3)
   c.closePath()
   c.clip()
-  c.translate((minX + maxX) / 2, (minY + maxY) / 2)
+  c.translate(mx, my)
   if (angle) c.rotate(angle)
-  drawCover(ctx, img, -side / 2, -side / 2, side, side)
+  drawCover(ctx, img, -cover / 2, -cover / 2, cover, cover)
   c.restore()
 }
 

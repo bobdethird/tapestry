@@ -161,8 +161,8 @@ async function handleGenerate(
   const canvas = new OffscreenCanvas(CANVAS_WIDTH, CANVAS_HEIGHT)
   const ctx = canvas.getContext("2d")
   if (!ctx) return
-  ctx.fillStyle = "#ffffff"
-  ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT)
+  // Transparent background — the main thread paints the reference's average color
+  // (the grout) behind the tiles so the gaps and tile shadows sit on-palette.
 
   const { cols, rows } = grid
   const cellCount = cols * rows

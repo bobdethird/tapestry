@@ -21,15 +21,19 @@ import { MosaicEngine } from "@/lib/mosaic-client"
 import {
   averageColor,
   drawPolygonMosaicRegion,
+  drawTileMosaicRegion,
   edgeMagnitudeField,
+  edgeVectorField,
   gridForCellSize,
   loadImage,
   referenceCellOrientations,
   referenceCellSignatures,
+  referenceWindowSignatures,
   type EdgeField,
   type Grid,
 } from "@/lib/mosaic"
 import { voronoiPolygons } from "@/lib/voronoi"
+import { contourMosaic } from "@/lib/contour-mosaic"
 import { cn } from "@/lib/utils"
 
 const CANVAS_WIDTH = 1600
@@ -45,6 +49,13 @@ const DENSITY_MAX = 80
 // contours — fine enough to resolve major edges, cheap to compute.
 const EDGE_FIELD_W = 256
 const EDGE_FIELD_H = Math.round((EDGE_FIELD_W * CANVAS_HEIGHT) / CANVAS_WIDTH)
+
+// A finer field for the contour-flow layout, which needs accurate edge
+// directions (not just strength) to lay tiles tangent to the photo's contours.
+const CONTOUR_FIELD_W = 360
+const CONTOUR_FIELD_H = Math.round(
+  (CONTOUR_FIELD_W * CANVAS_HEIGHT) / CANVAS_WIDTH
+)
 
 // Once zoomed past this scale we re-render the visible tiles from their
 // full-resolution sources so the constituent photos stay sharp instead of
@@ -849,6 +860,12 @@ export function CanvasHero() {
   const [reference, setReference] = React.useState<ReferenceImage | null>(null)
   const [density, setDensity] = React.useState(40)
   const [showContours, setShowContours] = React.useState(false)
+  // Tessellation style: "contour" (tiles laid along the photo's contours, then
+  // grown outward in parallel rows — opus vermiculatum) vs "voronoi"
+  // (edge-relaxed cells).
+  const [layoutMode, setLayoutMode] = React.useState<"contour" | "voronoi">(
+    "contour"
+  )
   // Average color of the loaded reference (the grout/background), shown on the
   // canvas as soon as the reference loads — before any mosaic is generated.
   const [bgColor, setBgColor] = React.useState<string | null>(null)
@@ -882,6 +899,9 @@ export function CanvasHero() {
   // thumbnail URLs. No full-resolution images are held — that's what lets this
   // scale to thousands of photos.
   const mosaicModelRef = React.useRef<{
+    // "grid" (voronoi) culls the overlay by grid math; "tiles" (contour-flow)
+    // culls by per-tile centers instead.
+    mode: "grid" | "tiles"
     grid: Grid
     assignment: Int32Array
     angles: Float32Array
@@ -889,6 +909,10 @@ export function CanvasHero() {
     offsets: Int32Array
     bg: string
     thumbUrls: string[]
+    // Present only for the "tiles" layout: each tile's center (x,y pairs) and a
+    // culling reach (≈ one tile) for the visible-region test.
+    centers?: Float32Array
+    tileExtent?: number
   } | null>(null)
   // Bumped whenever the mosaic is (re)generated or cleared, so the crisp-overlay
   // effect re-runs even when the zoom transform itself hasn't changed.
@@ -1058,26 +1082,58 @@ export function CanvasHero() {
       const refImg = refImgRef.current ?? (await loadImage(ref.url))
       refImgRef.current = refImg
       const grid = gridForCellSize(density, CANVAS_WIDTH, CANVAS_HEIGHT)
-      const cellSigs = referenceCellSignatures(refImg, grid)
-      // Per-cell edge orientation so each tile is rotated to follow the
-      // reference's contours.
-      const angles = referenceCellOrientations(refImg, grid)
-      // Voronoi tessellation: varied polygons (triangles … hexagons) that tile
-      // with no gaps. Seeds are relaxed against the reference's edge field so the
-      // cell borders follow its contours. Computed here and passed to the worker
-      // so both render the identical layout.
+      // Edge magnitude field — drives the contour mask plus the voronoi seed
+      // relaxation. Reuse the one cached when the reference loaded.
       const edge =
         edgeFieldRef.current ??
         edgeMagnitudeField(refImg, EDGE_FIELD_W, EDGE_FIELD_H)
       edgeFieldRef.current = edge
       edgeMaskRef.current = makeContourMask(edge)
       bgColorRef.current = averageColor(refImg)
-      const { polys, offsets } = voronoiPolygons(
-        grid,
-        CANVAS_WIDTH,
-        CANVAS_HEIGHT,
-        edge
-      )
+
+      // Each layout produces: matching signatures, a per-tile rotation, and the
+      // packed polygons. The contour-flow layout isn't grid-bound, so it also
+      // returns free-form tile centers (used to cull the crisp overlay).
+      let cellSigs: Float32Array[]
+      let angles: Float32Array
+      let polys: Float32Array
+      let offsets: Int32Array
+      let mode: "grid" | "tiles" = "grid"
+      let centers: Float32Array | undefined
+      let tileExtent: number | undefined
+      if (layoutMode === "contour") {
+        // Lay tiles along the reference's contours, then grow outward in rows
+        // that run parallel to them. Tile size follows the density slider; a
+        // finer edge field gives the flow accurate contour directions.
+        const vfield = edgeVectorField(refImg, CONTOUR_FIELD_W, CONTOUR_FIELD_H)
+        const cm = contourMosaic(CANVAS_WIDTH, CANVAS_HEIGHT, density, vfield)
+        polys = cm.polys
+        offsets = cm.offsets
+        angles = cm.angles
+        centers = cm.centers
+        tileExtent = cm.extent
+        mode = "tiles"
+        cellSigs = referenceWindowSignatures(
+          refImg,
+          cm.centers,
+          cm.tileSize,
+          CANVAS_WIDTH,
+          CANVAS_HEIGHT
+        )
+      } else {
+        cellSigs = referenceCellSignatures(refImg, grid)
+        // Per-cell edge orientation so each tile follows the local contour.
+        angles = referenceCellOrientations(refImg, grid)
+        // Voronoi tessellation: varied polygons (triangles … hexagons) that tile
+        // with no gaps. Seeds are relaxed against the edge field so cell borders
+        // follow the contours.
+        ;({ polys, offsets } = voronoiPolygons(
+          grid,
+          CANVAS_WIDTH,
+          CANVAS_HEIGHT,
+          edge
+        ))
+      }
       const ids = ready.map((p) => p.id)
       const thumbUrls = ready.map((p) => p.thumbUrl as string)
       // The worker matches tiles to cells and renders the base mosaic, streaming
@@ -1111,6 +1167,7 @@ export function CanvasHero() {
       // Keep the render model so the crisp overlay can repaint visible tiles
       // from their thumbnails as the user zooms in.
       mosaicModelRef.current = {
+        mode,
         grid,
         assignment,
         angles,
@@ -1118,6 +1175,8 @@ export function CanvasHero() {
         offsets,
         bg: bgColorRef.current,
         thumbUrls,
+        centers,
+        tileExtent,
       }
       setMosaicVersion((v) => v + 1)
       setHasMosaic(true)
@@ -1129,7 +1188,7 @@ export function CanvasHero() {
         setGenerateProgress(null)
       }
     }
-  }, [density])
+  }, [density, layoutMode])
 
   // Keep the latest generator in a ref so the live-density effect can call it
   // without resubscribing on every render.
@@ -1138,14 +1197,14 @@ export function CanvasHero() {
     generateRef.current = handleGenerate
   }, [handleGenerate])
 
-  // Once a mosaic exists, re-run (debounced) whenever density changes so the
-  // slider tunes the result live.
+  // Once a mosaic exists, re-run (debounced) whenever the density or the layout
+  // mode changes so the controls tune the result live.
   React.useEffect(() => {
     if (!hasMosaic) return
     const id = window.setTimeout(() => void generateRef.current(), 150)
     return () => window.clearTimeout(id)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [density])
+  }, [density, layoutMode])
 
   // Decode a thumbnail into an HTMLImageElement, memoized in a bounded LRU so
   // repeated overlay renders don't re-decode and memory stays flat.
@@ -1195,21 +1254,36 @@ export function CanvasHero() {
         w: cssW / t.scale,
         h: cssH / t.scale,
       }
-      const cw = CANVAS_WIDTH / grid.cols
-      const ch = CANVAS_HEIGHT / grid.rows
-      // Widen by two cells to match drawPolygonMosaicRegion, so Voronoi cells
-      // that spill in from just outside the region still get their tiles decoded.
-      const colStart = Math.max(0, Math.floor(region.x / cw) - 2)
-      const colEnd = Math.min(grid.cols - 1, Math.floor((region.x + region.w) / cw) + 2)
-      const rowStart = Math.max(0, Math.floor(region.y / ch) - 2)
-      const rowEnd = Math.min(grid.rows - 1, Math.floor((region.y + region.h) / ch) + 2)
-      if (colEnd < colStart || rowEnd < rowStart) return
-
-      // Decode only the tiles visible in this region.
+      // Decode only the tiles visible in this region: by grid math for the grid
+      // layout, or by tile center for the free-form contour-flow layout.
       const needed = new Set<number>()
-      for (let row = rowStart; row <= rowEnd; row++) {
-        for (let col = colStart; col <= colEnd; col++) {
-          needed.add(assignment[row * grid.cols + col])
+      if (model.mode === "tiles" && model.centers) {
+        const centers = model.centers
+        const extent = model.tileExtent ?? 0
+        const minX = region.x - extent
+        const maxX = region.x + region.w + extent
+        const minY = region.y - extent
+        const maxY = region.y + region.h + extent
+        for (let i = 0; i < centers.length / 2; i++) {
+          const x = centers[i * 2]
+          const y = centers[i * 2 + 1]
+          if (x < minX || x > maxX || y < minY || y > maxY) continue
+          needed.add(assignment[i])
+        }
+      } else {
+        const cw = CANVAS_WIDTH / grid.cols
+        const ch = CANVAS_HEIGHT / grid.rows
+        // Widen by two cells to match drawPolygonMosaicRegion, so Voronoi cells
+        // spilling in from just outside the region still get their tiles decoded.
+        const colStart = Math.max(0, Math.floor(region.x / cw) - 2)
+        const colEnd = Math.min(grid.cols - 1, Math.floor((region.x + region.w) / cw) + 2)
+        const rowStart = Math.max(0, Math.floor(region.y / ch) - 2)
+        const rowEnd = Math.min(grid.rows - 1, Math.floor((region.y + region.h) / ch) + 2)
+        if (colEnd < colStart || rowEnd < rowStart) return
+        for (let row = rowStart; row <= rowEnd; row++) {
+          for (let col = colStart; col <= colEnd; col++) {
+            needed.add(assignment[row * grid.cols + col])
+          }
         }
       }
       const tiles: (HTMLImageElement | null)[] = new Array(thumbUrls.length)
@@ -1246,18 +1320,32 @@ export function CanvasHero() {
         ctx.fillStyle = bg
         ctx.fillRect(fx, fy, fw, fh)
       }
-      drawPolygonMosaicRegion(
-        ctx,
-        grid,
-        assignment,
-        angles,
-        tiles,
-        CANVAS_WIDTH,
-        CANVAS_HEIGHT,
-        region,
-        polys,
-        offsets
-      )
+      if (model.mode === "tiles" && model.centers) {
+        drawTileMosaicRegion(
+          ctx,
+          assignment,
+          angles,
+          tiles,
+          region,
+          polys,
+          offsets,
+          model.centers,
+          model.tileExtent ?? 0
+        )
+      } else {
+        drawPolygonMosaicRegion(
+          ctx,
+          grid,
+          assignment,
+          angles,
+          tiles,
+          CANVAS_WIDTH,
+          CANVAS_HEIGHT,
+          region,
+          polys,
+          offsets
+        )
+      }
     },
     [ensureThumb]
   )
@@ -1493,6 +1581,34 @@ export function CanvasHero() {
             />
             contours
           </button>
+          <div className="flex items-center gap-2 px-1">
+            <span className="font-mono text-[10px] tracking-wider text-muted-foreground uppercase">
+              layout
+            </span>
+            <div className="ml-auto flex gap-0.5 rounded-md border border-border/60 p-0.5">
+              {(
+                [
+                  ["contour", "flow"],
+                  ["voronoi", "cells"],
+                ] as const
+              ).map(([value, label]) => (
+                <button
+                  key={value}
+                  type="button"
+                  onClick={() => setLayoutMode(value)}
+                  aria-pressed={layoutMode === value}
+                  className={cn(
+                    "rounded px-1.5 py-0.5 font-mono text-[9px] tracking-wider uppercase transition-colors",
+                    layoutMode === value
+                      ? "bg-primary text-primary-foreground"
+                      : "text-muted-foreground hover:text-foreground"
+                  )}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
           {isIndexing && (
             <div className="px-1 font-mono text-[10px] text-muted-foreground">
               <div className="mb-1 flex justify-between tabular-nums">

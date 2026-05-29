@@ -161,8 +161,10 @@ async function handleGenerate(
   // Transparent background — the main thread paints the reference's average color
   // (the grout) behind the tiles so the gaps and tile shadows sit on-palette.
 
-  const { cols, rows } = grid
-  const cellCount = cols * rows
+  // One tile per signature — the count is driven by `cellSigs`, not the grid, so
+  // the same path serves both the grid layout (voronoi, where it equals
+  // cols×rows) and the free-form contour-flow layout (an arbitrary tile count).
+  const cellCount = cellSigs.length
   const assignment = new Int32Array(cellCount)
   const decoded = new Map<number, ImageBitmap>()
   const cleanup = () => {

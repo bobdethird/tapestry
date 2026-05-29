@@ -140,6 +140,52 @@ export function referenceCellSignatures(
   return cells
 }
 
+// Per-tile color signatures for an arbitrary set of tile centers (used by the
+// contour-flow layout, whose tiles aren't on a grid). The reference is drawn
+// once into a buffer scaled so a `size`×`size` tile window maps to s×s buffer
+// pixels, then each tile reads its s×s block straight out of that buffer — far
+// cheaper than one canvas draw per tile. Sampling is axis-aligned (it ignores
+// the tile's rotation), which is fine for a coarse average-color signature.
+export function referenceWindowSignatures(
+  ref: TileSource,
+  centers: ArrayLike<number>,
+  size: number,
+  width: number,
+  height: number,
+  s = SIGNATURE_GRID
+): Float32Array[] {
+  const n = centers.length / 2
+  const scale = s / Math.max(1, size)
+  const bw = Math.max(s, Math.round(width * scale))
+  const bh = Math.max(s, Math.round(height * scale))
+  const ctx = createContext2d(bw, bh)
+  drawCover(ctx, ref, 0, 0, bw, bh)
+  const { data } = ctx.getImageData(0, 0, bw, bh)
+  const clampI = (v: number, hi: number) => (v < 0 ? 0 : v > hi ? hi : v)
+  const half = s / 2
+  const out: Float32Array[] = new Array(n)
+  for (let i = 0; i < n; i++) {
+    const bx = centers[i * 2] * scale - half
+    const by = centers[i * 2 + 1] * scale - half
+    const sx0 = Math.round(bx)
+    const sy0 = Math.round(by)
+    const sig = new Float32Array(s * s * 3)
+    for (let yy = 0; yy < s; yy++) {
+      const py = clampI(sy0 + yy, bh - 1)
+      for (let xx = 0; xx < s; xx++) {
+        const px = clampI(sx0 + xx, bw - 1)
+        const di = (py * bw + px) * 4
+        const k = (yy * s + xx) * 3
+        sig[k] = data[di]
+        sig[k + 1] = data[di + 1]
+        sig[k + 2] = data[di + 2]
+      }
+    }
+    out[i] = sig
+  }
+  return out
+}
+
 // Minimum Sobel gradient magnitude (on the coarse cols×rows luminance grid)
 // before a cell counts as "on an edge". Below it the local direction is mostly
 // noise, so the tile is left axis-aligned (angle 0).
@@ -242,6 +288,61 @@ export function edgeMagnitudeField(
   }
   for (let i = 0; i < mag.length; i++) mag[i] /= max
   return { mag, fw, fh }
+}
+
+// Like `EdgeField` but also retains the per-pixel gradient direction. The
+// contour-flow layout needs the direction (not just the strength) so it can lay
+// tiles tangent to the photo's edges.
+export type EdgeVectorField = {
+  mag: Float32Array
+  // Gradient direction in radians (atan2(gy, gx)). The contour tangent — the
+  // way a tile should point to run ALONG the edge — is this plus π/2.
+  dir: Float32Array
+  fw: number
+  fh: number
+}
+
+export function edgeVectorField(
+  ref: TileSource,
+  fw: number,
+  fh: number
+): EdgeVectorField {
+  const ctx = createContext2d(fw, fh)
+  drawCover(ctx, ref, 0, 0, fw, fh)
+  const { data } = ctx.getImageData(0, 0, fw, fh)
+  const lum = new Float32Array(fw * fh)
+  for (let i = 0; i < fw * fh; i++) {
+    lum[i] =
+      0.299 * data[i * 4] + 0.587 * data[i * 4 + 1] + 0.114 * data[i * 4 + 2]
+  }
+  const at = (x: number, y: number) => {
+    const cx = x < 0 ? 0 : x >= fw ? fw - 1 : x
+    const cy = y < 0 ? 0 : y >= fh ? fh - 1 : y
+    return lum[cy * fw + cx]
+  }
+  const mag = new Float32Array(fw * fh)
+  const dir = new Float32Array(fw * fh)
+  let max = 1e-6
+  for (let y = 0; y < fh; y++) {
+    for (let x = 0; x < fw; x++) {
+      const gx =
+        at(x + 1, y - 1) +
+        2 * at(x + 1, y) +
+        at(x + 1, y + 1) -
+        (at(x - 1, y - 1) + 2 * at(x - 1, y) + at(x - 1, y + 1))
+      const gy =
+        at(x - 1, y + 1) +
+        2 * at(x, y + 1) +
+        at(x + 1, y + 1) -
+        (at(x - 1, y - 1) + 2 * at(x, y - 1) + at(x + 1, y - 1))
+      const m = Math.hypot(gx, gy)
+      mag[y * fw + x] = m
+      dir[y * fw + x] = Math.atan2(gy, gx)
+      if (m > max) max = m
+    }
+  }
+  for (let i = 0; i < mag.length; i++) mag[i] /= max
+  return { mag, dir, fw, fh }
 }
 
 export function mse(a: Float32Array, b: Float32Array): number {
@@ -444,5 +545,36 @@ export function drawPolygonMosaicRegion(
       if (!tile) continue
       drawPolygonCell(ctx, polys, offsets, idx, tile, angles[idx])
     }
+  }
+}
+
+// Like `drawPolygonMosaicRegion`, but for the contour-flow layout whose tiles
+// are NOT on a grid (their count and positions are free). Culling is by each
+// tile's center against the region, widened by `extent` (≈ a tile's reach) so
+// tiles whose center sits just outside still paint into the view. Cheap enough
+// to scan every tile since the overlay only repaints once a gesture settles.
+export function drawTileMosaicRegion(
+  ctx: AnyCanvasContext,
+  assignment: ArrayLike<number>,
+  angles: ArrayLike<number>,
+  tiles: ReadonlyArray<TileSource | null | undefined>,
+  region: Region,
+  polys: ArrayLike<number>,
+  offsets: ArrayLike<number>,
+  centers: ArrayLike<number>,
+  extent: number
+) {
+  const n = centers.length / 2
+  const minX = region.x - extent
+  const maxX = region.x + region.w + extent
+  const minY = region.y - extent
+  const maxY = region.y + region.h + extent
+  for (let i = 0; i < n; i++) {
+    const x = centers[i * 2]
+    const y = centers[i * 2 + 1]
+    if (x < minX || x > maxX || y < minY || y > maxY) continue
+    const tile = tiles[assignment[i]]
+    if (!tile) continue
+    drawPolygonCell(ctx, polys, offsets, i, tile, angles[i])
   }
 }

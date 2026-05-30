@@ -439,7 +439,7 @@ export function drawMosaicRegion(
 
 // Gap between tiles (fraction each shrinks toward its center) and the soft drop
 // shadow that makes every tile read as a raised mosaic piece.
-const TILE_GAP = 0.08
+const TILE_GAP = 0.09
 const TILE_SHADOW_COLOR = "rgba(0, 0, 0, 0.32)"
 const TILE_SHADOW_BLUR = 0.12 // × tile size
 const TILE_SHADOW_OFFSET = 0.05 // × tile size

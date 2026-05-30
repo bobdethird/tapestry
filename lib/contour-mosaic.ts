@@ -9,9 +9,13 @@
 //      breadth-first wavefront from the contour seeds fills the plane with rows
 //      that run parallel to the edges — exactly the look of opus vermiculatum.
 //   3. Each tile's SHAPE is the Voronoi cell of its seed (clipped against nearby
-//      seeds), lightly jittered, then reduced to a triangle or quadrilateral.
-//      Because the seeds sit in contour-following rows, the cells tessellate AND
-//      flow — varied warped quads/triangles instead of rigid squares.
+//      seeds), then simplified toward a quadrilateral: corners are dropped
+//      shallowest-first until the cell is a quad, but a corner sharper than a
+//      budget is spared (so it stays a pentagon rather than gouging a gap), and a
+//      near-flat corner collapses to a triangle. Edges sit at the natural angles
+//      between neighbours, so quadrilaterals dominate with triangles and
+//      pentagons mixed in — and because every cell stays a subset of its Voronoi
+//      cell, tiles never overlap.
 //
 // The output is the same packed-polygon format the renderer already consumes
 // (`polys` + `offsets`), plus per-tile `angles` and `centers`, so nothing
@@ -44,9 +48,19 @@ const MIN_DIST_FRAC = 0.74
 // Seed jitter (× tile size) applied before tessellating, so flat regions break
 // out of a perfectly regular lattice into varied, organic quads.
 const JITTER = 0.14
-// Largest number of sides a tile may have, so cells stay as triangles/quads
-// rather than Voronoi pentagons and hexagons. Set higher to allow richer shapes.
-const MAX_SIDES = 4
+// Hard cap on a tile's side count: a cell with this many genuinely-sharp corners
+// (a rare true hexagon) loses its least-defining one, becoming a pentagon.
+const MAX_SIDES = 5
+// Quad target: when reducing a 5+-gon toward a quadrilateral we may drop a corner
+// only if its vertex sits closer than this (× tile size) to the line between its
+// neighbours. So most cells collapse to quads, but a cell whose extra corner is
+// SHARPER than this keeps it as a pentagon instead of carving a big gap. This is
+// the main dial: larger ⇒ more quads (and larger slivers where a corner drops),
+// smaller ⇒ more pentagons but tighter fit.
+const QUAD_DEV_FRAC = 0.26
+// A corner shallower than this (× tile) is a negligible bevel, dropped even from
+// a quad — this is what yields the occasional triangle where a side is near-flat.
+const FLAT_DEV_FRAC = 0.07
 // Chaikin corner-cutting passes used to curve the cell edges. 0 = hard polygons,
 // 2 = soft curved quadrilaterals. More passes = rounder (and more vertices).
 const CURVE_ITERS = 0
@@ -104,28 +118,64 @@ function clipHalfPlane(poly: Pt[], a: number, b: number, c: number): Pt[] {
   return out
 }
 
-// Reduce a convex polygon to at most `maxSides` vertices by repeatedly dropping
-// the least-significant corner — the vertex whose ear (prev–this–next triangle)
-// has the smallest area, i.e. the flattest, least-defining one. Voronoi penta-
-// and hexagons collapse to quads while existing triangles/quads pass through.
-function reduceToSides(poly: Pt[], maxSides: number): Pt[] {
-  let p = poly
-  while (p.length > maxSides) {
-    const n = p.length
-    let minArea = Infinity
-    let idx = 0
-    for (let i = 0; i < n; i++) {
-      const a = p[(i - 1 + n) % n]
-      const b = p[i]
-      const c = p[(i + 1) % n]
-      const area = Math.abs(
-        (b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])
-      )
-      if (area < minArea) {
-        minArea = area
-        idx = i
-      }
+// Perpendicular distance from vertex `b` to the line through its neighbours `a`
+// and `c` — how far the corner bulges out of the chord, i.e. how "real" it is. A
+// near-collinear (flat) corner returns ~0.
+function cornerDeviation(a: Pt, b: Pt, c: Pt): number {
+  const ex = c[0] - a[0]
+  const ey = c[1] - a[1]
+  const len = Math.hypot(ex, ey)
+  if (len < 1e-9) return 0
+  return Math.abs((b[0] - a[0]) * ey - (b[1] - a[1]) * ex) / len
+}
+
+// Index of the shallowest corner (the least-defining one, whose vertex is
+// closest to the chord between its neighbours), or -1 if none is below `limit`.
+function shallowestCorner(p: Pt[], limit: number): number {
+  const n = p.length
+  let idx = -1
+  let min = limit
+  for (let i = 0; i < n; i++) {
+    const dev = cornerDeviation(p[(i - 1 + n) % n], p[i], p[(i + 1) % n])
+    if (dev < min) {
+      min = dev
+      idx = i
     }
+  }
+  return idx
+}
+
+// Simplify a convex Voronoi cell toward a quadrilateral while keeping it space-
+// filling. Each pass drops the shallowest qualifying corner — the least-defining
+// one, so the sliver left behind is smallest. Three stages:
+//   1. Drive toward a quad: drop corners shallower than `quadDev`, so most cells
+//      become quadrilaterals; a 5+-gon whose extra corner is sharper than that is
+//      left alone rather than gouged into a big gap.
+//   2. Hard-cap at `maxSides`, dropping the least-defining corner even if sharp
+//      (a rare all-sharp hexagon becomes a pentagon).
+//   3. Collapse a near-flat corner (below `flatDev`) so a barely-bent quad reads
+//      as the triangle it nearly is.
+// Net: quadrilaterals dominate, with pentagons only where a corner is genuinely
+// sharp and triangles where one is genuinely flat.
+function simplifyCell(
+  poly: Pt[],
+  maxSides: number,
+  quadDev: number,
+  flatDev: number
+): Pt[] {
+  let p = poly
+  while (p.length > 4) {
+    const idx = shallowestCorner(p, quadDev)
+    if (idx < 0) break
+    p = p.slice(0, idx).concat(p.slice(idx + 1))
+  }
+  while (p.length > maxSides) {
+    const idx = shallowestCorner(p, Infinity)
+    p = p.slice(0, idx).concat(p.slice(idx + 1))
+  }
+  while (p.length > 3) {
+    const idx = shallowestCorner(p, flatDev)
+    if (idx < 0) break
     p = p.slice(0, idx).concat(p.slice(idx + 1))
   }
   return p
@@ -337,12 +387,18 @@ export function contourMosaic(
     jy[i] = Math.min(height, Math.max(0, cy[i] + (rng() * 2 - 1) * JITTER * s))
   }
 
-  // ---- Voronoi cell per seed -------------------------------------------------
+  // ---- Voronoi cell per seed, simplified toward a quad -----------------------
   // Clip a generous box against the perpendicular bisectors of nearby seeds
-  // (found through the same spatial hash used during placement). The result is a
-  // tessellating polygon — triangle … hexagon — that hugs its neighbours.
+  // (found through the same spatial hash used during placement). That yields the
+  // exact Voronoi cell — a polygon whose edges sit at the natural angles between
+  // neighbours and that tessellates with no gaps and no overlaps. Then simplify
+  // it toward a quad: a roughly-square flow lattice makes most cells near-squares
+  // (quads with tiny bevels), which collapse to clean quadrilaterals, while
+  // genuine triangles and pentagons survive where the geometry needs them.
   const boxHalf = s * 3
   const ring = 3
+  const quadDev = QUAD_DEV_FRAC * s
+  const flatDev = FLAT_DEV_FRAC * s
   const cells: Pt[][] = new Array(n)
   for (let i = 0; i < n; i++) {
     const sx = jx[i]
@@ -381,11 +437,10 @@ export function contourMosaic(
         if (!poly.length) break
       }
     }
-    // Reduce to a triangle/quad, then optionally curve its edges. Grout absorbs
-    // the small mismatch both steps introduce along shared borders.
+    // Simplify to mostly-quads (triangles … pentagons), then optionally curve.
     cells[i] =
       poly.length >= 3
-        ? chaikin(reduceToSides(poly, MAX_SIDES), CURVE_ITERS)
+        ? chaikin(simplifyCell(poly, MAX_SIDES, quadDev, flatDev), CURVE_ITERS)
         : poly
   }
 

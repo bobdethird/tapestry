@@ -1,0 +1,18 @@
+---
+description: Git branch and commit conventions
+alwaysApply: true
+---
+
+# Git Branch Naming
+
+When creating branches, do NOT use the `cursor/<name>` prefix. Use a plain, descriptive branch name instead.
+
+```bash
+# ❌ BAD
+git checkout -b cursor/add-login-form
+
+# ✅ GOOD
+git checkout -b add-login-form
+```
+
+Apply the same convention when committing or pushing: branch names should never carry the `cursor/` prefix.

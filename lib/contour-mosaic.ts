@@ -7,7 +7,9 @@
 //      so far: every seed spawns neighbours alongside and beside it, inheriting
 //      its flow direction (snapping back to a contour where one is near). A
 //      breadth-first wavefront from the contour seeds fills the plane with rows
-//      that run parallel to the edges — exactly the look of opus vermiculatum.
+//      that run parallel to the edges — exactly the look of opus vermiculatum. A
+//      short relaxation then settles the seeds onto a locally-square lattice so
+//      the resulting tiles' corners come out close to 90°.
 //   3. Each tile's SHAPE is the Voronoi cell of its seed (clipped against nearby
 //      seeds), then simplified toward a quadrilateral: corners are dropped
 //      shallowest-first until the cell is a quad, but a corner sharper than a
@@ -46,8 +48,17 @@ const SNAP_MAG = 0.13
 // nearer than this, which both prevents pile-ups and sets the packing tightness.
 const MIN_DIST_FRAC = 0.74
 // Seed jitter (× tile size) applied before tessellating, so flat regions break
-// out of a perfectly regular lattice into varied, organic quads.
-const JITTER = 0.14
+// out of a perfectly regular lattice into varied, organic quads. Kept small so
+// it doesn't undo the squaring-up relaxation below.
+const JITTER = 0.07
+// Before tessellating, seeds are relaxed onto a locally-square lattice so tile
+// corners come out near 90°: each pass nudges a seed (at RELAX_RATE) toward where
+// its nearest neighbour in each flow-frame direction would sit one step away
+// on-axis. Displacement from the contour-placed home is capped (× tile size) so
+// the flow and edges are preserved. RELAX_ITERS = 0 disables the pass.
+const RELAX_ITERS = 6
+const RELAX_RATE = 0.5
+const RELAX_MAX_DISP = 0.7
 // Hard cap on a tile's side count: a cell with this many genuinely-sharp corners
 // (a rare true hexagon) loses its least-defining one, becoming a pentagon.
 const MAX_SIDES = 5
@@ -374,6 +385,145 @@ export function contourMosaic(
         place(x, y, th)
       }
       rowParity ^= 1
+    }
+  }
+
+  // ---- Relax seeds toward a locally-square lattice ---------------------------
+  // A tile's corners read as ~90° only when its four neighbours sit squarely
+  // along its flow frame (±along, ±across). Placement gets close, but colliding
+  // growth fronts, contour chains and the hole sweep leave seeds skewed off that
+  // grid. Each pass nudges a seed toward the average of where its nearest
+  // neighbour in every frame direction would sit one step away on-axis — squaring
+  // up the neighbourhood, and so the Voronoi cell's angles — then refreshes the
+  // hash. A cap keeps seeds near where the contours originally placed them.
+  if (RELAX_ITERS > 0) {
+    const homeX = cx.slice()
+    const homeY = cy.slice()
+    const relaxCap = RELAX_MAX_DISP * s
+    const rr = 2
+    const tcx = new Array<number>(cx.length)
+    const tcy = new Array<number>(cx.length)
+    for (let it = 0; it < RELAX_ITERS; it++) {
+      for (let i = 0; i < cx.length; i++) {
+        const xi = cx[i]
+        const yi = cy[i]
+        const th = ang[i]
+        const ux = Math.cos(th)
+        const uy = Math.sin(th)
+        const vx = -uy
+        const vy = ux
+        // Nearest neighbour (by distance) in each of the four frame directions.
+        let dPU = Infinity
+        let dMU = Infinity
+        let dPV = Infinity
+        let dMV = Infinity
+        let pUx = 0
+        let pUy = 0
+        let mUx = 0
+        let mUy = 0
+        let pVx = 0
+        let pVy = 0
+        let mVx = 0
+        let mVy = 0
+        const gx = cellGx(xi)
+        const gy = cellGy(yi)
+        for (let dy = -rr; dy <= rr; dy++) {
+          for (let dx = -rr; dx <= rr; dx++) {
+            const list = hash.get(keyOf(gx + dx, gy + dy))
+            if (!list) continue
+            for (let li = 0; li < list.length; li++) {
+              const j = list[li]
+              if (j === i) continue
+              const rx = cx[j] - xi
+              const ry = cy[j] - yi
+              const r2 = rx * rx + ry * ry
+              if (r2 < 1e-9) continue
+              const pu = rx * ux + ry * uy
+              const pv = rx * vx + ry * vy
+              if (Math.abs(pu) >= Math.abs(pv)) {
+                if (pu >= 0) {
+                  if (r2 < dPU) {
+                    dPU = r2
+                    pUx = cx[j]
+                    pUy = cy[j]
+                  }
+                } else if (r2 < dMU) {
+                  dMU = r2
+                  mUx = cx[j]
+                  mUy = cy[j]
+                }
+              } else if (pv >= 0) {
+                if (r2 < dPV) {
+                  dPV = r2
+                  pVx = cx[j]
+                  pVy = cy[j]
+                }
+              } else if (r2 < dMV) {
+                dMV = r2
+                mVx = cx[j]
+                mVy = cy[j]
+              }
+            }
+          }
+        }
+        let sx = 0
+        let sy = 0
+        let cnt = 0
+        if (dPU < Infinity) {
+          sx += pUx - s * ux
+          sy += pUy - s * uy
+          cnt++
+        }
+        if (dMU < Infinity) {
+          sx += mUx + s * ux
+          sy += mUy + s * uy
+          cnt++
+        }
+        if (dPV < Infinity) {
+          sx += pVx - s * vx
+          sy += pVy - s * vy
+          cnt++
+        }
+        if (dMV < Infinity) {
+          sx += mVx + s * vx
+          sy += mVy + s * vy
+          cnt++
+        }
+        if (cnt === 0) {
+          tcx[i] = xi
+          tcy[i] = yi
+          continue
+        }
+        let mx = xi + RELAX_RATE * (sx / cnt - xi)
+        let my = yi + RELAX_RATE * (sy / cnt - yi)
+        // Cap displacement from the contour-placed home.
+        const ex = mx - homeX[i]
+        const ey = my - homeY[i]
+        const e2 = ex * ex + ey * ey
+        if (e2 > relaxCap * relaxCap) {
+          const f = relaxCap / Math.sqrt(e2)
+          mx = homeX[i] + ex * f
+          my = homeY[i] + ey * f
+        }
+        tcx[i] = Math.min(width, Math.max(0, mx))
+        tcy[i] = Math.min(height, Math.max(0, my))
+      }
+      for (let i = 0; i < cx.length; i++) {
+        cx[i] = tcx[i]
+        cy[i] = tcy[i]
+      }
+      // Refresh the spatial hash so the next pass — and the tessellation below —
+      // query neighbours at their new positions.
+      hash.clear()
+      for (let i = 0; i < cx.length; i++) {
+        const k = keyOf(cellGx(cx[i]), cellGy(cy[i]))
+        let list = hash.get(k)
+        if (!list) {
+          list = []
+          hash.set(k, list)
+        }
+        list.push(i)
+      }
     }
   }
 

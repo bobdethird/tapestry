@@ -6,8 +6,19 @@ import type { Grid } from "./mosaic"
 
 export type IngestItem = { id: string; blob: Blob }
 
+// A photo restored from the cache, replayed into the worker's in-memory store so
+// it can participate in matching/rendering without being re-decoded.
+export type HydrateItem = {
+  id: string
+  sig: Float32Array
+  thumb: Blob
+  w: number
+  h: number
+}
+
 export type WorkerRequest =
   | { type: "ingest"; items: IngestItem[] }
+  | { type: "hydrate"; items: HydrateItem[] }
   | {
       type: "generate"
       reqId: number
@@ -26,9 +37,18 @@ export type WorkerRequest =
   | { type: "clear" }
 
 export type WorkerResponse =
-  // One per photo as ingest completes. `thumb` is null if the image could not be
-  // decoded (e.g. an unsupported format), in which case the tile is unusable.
-  | { type: "ingested"; id: string; thumb: Blob | null; dateCaption: string | null }
+  // One per photo as ingest completes. `thumb`/`sig` are null if the image could
+  // not be decoded (e.g. an unsupported format), in which case the tile is
+  // unusable. `sig`/`w`/`h` are echoed back so the main thread can cache them.
+  | {
+      type: "ingested"
+      id: string
+      thumb: Blob | null
+      dateCaption: string | null
+      sig: Float32Array | null
+      w: number
+      h: number
+    }
   | { type: "progress"; done: number; total: number }
   // An in-progress snapshot of the mosaic as it fills in (cells matched so far),
   // emitted periodically during generate so the UI can show live progress.

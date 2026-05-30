@@ -2,12 +2,21 @@
 // promise/callback API so components don't deal with raw messages.
 
 import type { Grid } from "./mosaic"
-import type { WorkerRequest, WorkerResponse } from "./mosaic-protocol"
+import type {
+  HydrateItem,
+  WorkerRequest,
+  WorkerResponse,
+} from "./mosaic-protocol"
 
 export type IngestedTile = {
   id: string
   thumb: Blob | null
   dateCaption: string | null
+  // Echoed back so the caller can persist the photo: its color signature and
+  // thumbnail dimensions (null sig when the image couldn't be decoded).
+  sig: Float32Array | null
+  w: number
+  h: number
 }
 
 export type GenerateResult = { assignment: Int32Array; base: ImageBitmap }
@@ -46,6 +55,9 @@ export class MosaicEngine {
           id: msg.id,
           thumb: msg.thumb,
           dateCaption: msg.dateCaption,
+          sig: msg.sig,
+          w: msg.w,
+          h: msg.h,
         })
       } else if (msg.type === "progress") {
         this.onProgress?.(msg.done, msg.total)
@@ -67,6 +79,12 @@ export class MosaicEngine {
 
   ingest(items: { id: string; blob: Blob }[]) {
     if (items.length) this.send({ type: "ingest", items })
+  }
+
+  // Replay cached photos into the worker's store so a restored library can be
+  // matched/rendered without re-decoding the originals.
+  hydrate(items: HydrateItem[]) {
+    if (items.length) this.send({ type: "hydrate", items })
   }
 
   generate(

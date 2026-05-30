@@ -5,9 +5,16 @@ import { Frame, Maximize, Minus, Plus, Sparkles } from "lucide-react"
 
 import {
   PhotoDock,
+  fileKeyOf,
   makePhotoFromFile,
+  tiltForIndex,
   type Photo,
 } from "@/components/photo-dock"
+import {
+  deleteCachedPhoto,
+  getAllCachedPhotos,
+  putCachedPhoto,
+} from "@/lib/photo-cache"
 import {
   ReferenceCard,
   ReferenceEmptyCard,
@@ -945,9 +952,10 @@ export function CanvasHero() {
   // extraction, tile matching, and base-canvas rendering, keeping the main
   // thread responsive with thousands of photos.
   React.useEffect(() => {
+    let cancelled = false
     const engine = new MosaicEngine()
     engineRef.current = engine
-    engine.onIngested = ({ id, thumb, dateCaption }) => {
+    engine.onIngested = ({ id, thumb, dateCaption, sig, w, h }) => {
       const url = thumb ? URL.createObjectURL(thumb) : undefined
       setPhotos((curr) => {
         const idx = curr.findIndex((p) => p.id === id)
@@ -967,9 +975,60 @@ export function CanvasHero() {
         }
         return next
       })
+      // Persist the freshly-indexed photo so it's restored (not re-indexed) next
+      // session. fileKey/caption come from the ref to avoid a setState side effect.
+      if (thumb && sig) {
+        const p = photosRef.current.find((pp) => pp.id === id)
+        if (p) {
+          void putCachedPhoto({
+            fileKey: p.fileKey,
+            id,
+            thumb,
+            sig,
+            w,
+            h,
+            caption: dateCaption ?? p.caption,
+            dateCaption,
+            addedAt: Date.now(),
+          })
+        }
+      }
     }
     engine.onProgress = (done, total) => setIngestProgress({ done, total })
+    // Restore a previously-cached library: rebuild the dock and replay the
+    // signatures/thumbnails into the worker so nothing is re-decoded.
+    void (async () => {
+      const cached = await getAllCachedPhotos()
+      if (cancelled || cached.length === 0) return
+      cached.sort((a, b) => a.addedAt - b.addedAt)
+      engine.hydrate(
+        cached.map((c) => ({
+          id: c.id,
+          sig: c.sig,
+          thumb: c.thumb,
+          w: c.w,
+          h: c.h,
+        }))
+      )
+      setPhotos((prev) => {
+        const have = new Set(prev.map((p) => p.fileKey))
+        const restored: Photo[] = []
+        cached.forEach((c, i) => {
+          if (have.has(c.fileKey)) return
+          restored.push({
+            id: c.id,
+            fileKey: c.fileKey,
+            thumbUrl: URL.createObjectURL(c.thumb),
+            rotation: tiltForIndex(prev.length + i),
+            caption: c.caption,
+            status: "ready",
+          })
+        })
+        return restored.length ? [...prev, ...restored] : prev
+      })
+    })()
     return () => {
+      cancelled = true
       engine.terminate()
       engineRef.current = null
     }
@@ -988,22 +1047,35 @@ export function CanvasHero() {
   }, [])
 
   const handleAddPhotos = React.useCallback((files: File[]) => {
+    // Skip files already in the library (same name/size/mtime) so re-adding the
+    // same photos doesn't re-index them — the cache already holds them.
+    const seen = new Set(photosRef.current.map((p) => p.fileKey))
+    const fresh: File[] = []
+    for (const f of files) {
+      const key = fileKeyOf(f)
+      if (seen.has(key)) continue
+      seen.add(key)
+      fresh.push(f)
+    }
+    if (fresh.length === 0) return
     // Show pending photos immediately; the worker streams back thumbnails and
     // EXIF captions as it indexes them. Originals are handed to the worker and
     // not retained on the main thread.
     const base = photosRef.current.length
-    const created = files.map((f, i) => makePhotoFromFile(f, base + i))
+    const created = fresh.map((f, i) => makePhotoFromFile(f, base + i))
     setPhotos((prev) => [...prev, ...created])
     engineRef.current?.ingest(
-      created.map((p, i) => ({ id: p.id, blob: files[i] }))
+      created.map((p, i) => ({ id: p.id, blob: fresh[i] }))
     )
   }, [])
 
   const handleRemovePhoto = React.useCallback((id: string) => {
     engineRef.current?.drop([id])
+    const target = photosRef.current.find((p) => p.id === id)
+    if (target) void deleteCachedPhoto(target.fileKey)
     setPhotos((prev) => {
-      const target = prev.find((p) => p.id === id)
-      if (target?.thumbUrl) URL.revokeObjectURL(target.thumbUrl)
+      const t = prev.find((p) => p.id === id)
+      if (t?.thumbUrl) URL.revokeObjectURL(t.thumbUrl)
       return prev.filter((p) => p.id !== id)
     })
     setSelectedPhotoId((curr) => (curr === id ? null : curr))

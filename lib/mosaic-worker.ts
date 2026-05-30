@@ -87,11 +87,12 @@ async function ingestOne(item: IngestItem): Promise<void> {
     const thumb = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.82 })
     store.set(id, { sig, thumb, w: tw, h: th })
     const dateCaption = await readCaptureDate(blob)
-    post({ type: "ingested", id, thumb, dateCaption })
+    // `sig` is cloned (not transferred) so the worker keeps its copy in `store`.
+    post({ type: "ingested", id, thumb, dateCaption, sig, w: tw, h: th })
   } catch {
     // Undecodable (e.g. an unsupported format) — report it so the UI can stop
     // showing a spinner; the tile simply won't participate in the mosaic.
-    post({ type: "ingested", id, thumb: null, dateCaption: null })
+    post({ type: "ingested", id, thumb: null, dateCaption: null, sig: null, w: 0, h: 0 })
   } finally {
     done++
     post({ type: "progress", done, total })
@@ -252,6 +253,12 @@ scope.onmessage = (e: MessageEvent<WorkerRequest>) => {
         msg.polys,
         msg.offsets
       )
+      break
+    case "hydrate":
+      // Restore cached photos into the store so they're usable immediately.
+      for (const it of msg.items) {
+        store.set(it.id, { sig: it.sig, thumb: it.thumb, w: it.w, h: it.h })
+      }
       break
     case "drop":
       for (const id of msg.ids) store.delete(id)

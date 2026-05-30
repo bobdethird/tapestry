@@ -8,6 +8,9 @@ import { cn } from "@/lib/utils"
 
 export type Photo = {
   id: string
+  // Stable file identity (name:size:lastModified) used to dedupe re-uploads and
+  // key the persistent cache.
+  fileKey: string
   // Object URL of the worker-generated thumbnail. Undefined while the photo is
   // still being indexed, or if it couldn't be decoded.
   thumbUrl?: string
@@ -33,8 +36,13 @@ const OVERSCAN = 6
 // Deterministic rotations so polaroids don't jitter on re-render
 const TILT_PATTERN = [-4, 3, -2, 5, -3, 2, -5, 4, -1, 3, -3, 2]
 
-function tiltForIndex(i: number) {
+export function tiltForIndex(i: number) {
   return TILT_PATTERN[i % TILT_PATTERN.length]
+}
+
+// Stable per-file identity for dedupe + caching, without reading the bytes.
+export function fileKeyOf(file: File): string {
+  return `${file.name}:${file.size}:${file.lastModified}`
 }
 
 function captionFromFile(file: File) {
@@ -53,6 +61,7 @@ function captionFromFile(file: File) {
 export function makePhotoFromFile(file: File, index: number): Photo {
   return {
     id: crypto.randomUUID(),
+    fileKey: fileKeyOf(file),
     rotation: tiltForIndex(index),
     caption: captionFromFile(file),
     status: "pending",
